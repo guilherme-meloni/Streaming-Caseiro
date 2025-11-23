@@ -7,7 +7,7 @@
     import { fly } from 'svelte/transition';
     import EpisodeDetailsModal from './EpisodeDetailsModal.svelte';
     import { addToFavorites } from '$lib/stores/favorites';
-    import { Plus } from 'lucide-svelte';
+    import { Plus, Check, Play } from 'lucide-svelte';
     import { watchHistory } from '$lib/stores/watchHistory';
 
     let FileTransfer: any;
@@ -28,6 +28,10 @@
 
     // UI states
     let showSimilar = false; // <-- similares começam ocultos
+
+    // Local watch markers (persistidos em localStorage)
+    let manualWatched: Record<string, boolean> = {};
+    let currentPlaying: string | null = null;
 
     const dispatch = createEventDispatcher();
     function goBack() { dispatch('back'); }
@@ -113,7 +117,48 @@
     }
     $: moviePath = isMovie ? getMovieRelativePath() : null;
 
+    // --- local storage helpers for manual watched + nowPlaying ---
+    const LS_MANUAL_KEY = 'manualWatched_v1';
+    const LS_NOWPLAYING = 'nowPlaying';
+
+    function loadManualWatched() {
+        if (!browser) return;
+        try {
+            const raw = localStorage.getItem(LS_MANUAL_KEY);
+            manualWatched = raw ? JSON.parse(raw) : {};
+        } catch (e) {
+            manualWatched = {};
+        }
+    }
+    function saveManualWatched() {
+        if (!browser) return;
+        try {
+            localStorage.setItem(LS_MANUAL_KEY, JSON.stringify(manualWatched || {}));
+        } catch (e) {}
+    }
+    function toggleManualWatched(path: string) {
+        if (!path) return;
+        manualWatched = { ...(manualWatched || {}) };
+        manualWatched[path] = !manualWatched[path];
+        saveManualWatched();
+    }
+    function setNowPlaying(path: string | null) {
+        if (!browser) return;
+        currentPlaying = path;
+        try {
+          if (path) localStorage.setItem(LS_NOWPLAYING, path);
+          else localStorage.removeItem(LS_NOWPLAYING);
+        } catch(e){}
+    }
+    function loadNowPlaying() {
+        if (!browser) return;
+        try { currentPlaying = localStorage.getItem(LS_NOWPLAYING); } catch(e) { currentPlaying = null; }
+    }
+
     onMount(async () => {
+        loadManualWatched();
+        loadNowPlaying();
+
         if (browser) {
             try {
                 const [fileTransferModule, filesystemModule] = await Promise.all([
@@ -152,6 +197,32 @@
             alert(`Falha ao baixar "${fileName}". Veja o console para mais detalhes.`);
         }
     }
+
+    // helper that checks both watchHistory (auto progress) and manualWatched
+    function isEpisodeWatched(path: string) {
+        if (!path) return false;
+        try {
+            // $watchHistory expected to be a Map-like value (you already used $watchHistory.get)
+            const prog = ($watchHistory as any)?.get ? ($watchHistory as any).get(path) : null;
+            if (prog && prog.isComplete) return true;
+        } catch (e) {}
+        if (manualWatched && manualWatched[path]) return true;
+        return false;
+    }
+
+    // called when user clicks the episode link; sets nowPlaying before navigation and marks watched
+    function onEpisodeClick(path: string) {
+        if (!path) return;
+        // marcar como visto ao iniciar manualmente (conforme pediu)
+        try {
+            manualWatched = { ...(manualWatched || {}) };
+            manualWatched[path] = true;
+            saveManualWatched();
+        } catch(e){}
+        // definir nowPlaying para feedback visual imediato
+        setNowPlaying(path);
+        // allow link navigation to proceed (href on <a> will navigate)
+    }
 </script>
 
 <style>
@@ -167,6 +238,25 @@
     .meta-row { display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
     .meta-pill { background:rgba(255,255,255,0.04); padding:0.25rem 0.6rem; border-radius:0.5rem; font-size:0.85rem; }
     .similar-toggle { display:inline-flex; gap:0.5rem; align-items:center; cursor:pointer; padding:0.25rem 0.5rem; border-radius:0.5rem; border:1px solid rgba(255,255,255,0.06); }
+    /* watched visuals */
+    .ep-thumb-wrap { position:relative; display:inline-block; }
+    .ep-watched-badge {
+        position:absolute;
+        right:6px;
+        top:6px;
+        background:rgba(0,0,0,0.6);
+        border-radius:999px;
+        padding:4px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+    }
+    .ep-current-outline {
+        box-shadow: 0 0 0 3px rgba(34,197,94,0.12) inset, 0 6px 20px rgba(34,197,94,0.06);
+        border-radius:8px;
+    }
+    .ep-thumb-dim { opacity: 0.6; filter:grayscale(.12); }
+    .mark-btn { margin-left:8px; font-size:12px; padding:6px 8px; border-radius:999px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:inherit; cursor:pointer; }
 </style>
 
 <div in:fly={{ y: 200, duration: 300 }}>
@@ -213,7 +303,7 @@
         {#if isMovie}
             <div class="mt-6 flex items-center gap-3">
                 {#if moviePath}
-                    <a href={`/player?play=${encodeURIComponent(moviePath)}&showCode=${encodeURIComponent(details.code)}`} class="btn btn-primary" aria-label="Assistir filme">
+                    <a href={`/player?play=${encodeURIComponent(moviePath)}&showCode=${encodeURIComponent(details.code)}`} class="btn btn-primary" aria-label="Assistir filme" on:click={() => onEpisodeClick(moviePath)}>
                         <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7.5 5.4c0-.9.98-1.45 1.75-.95l8.25 5.25c.71.45.71 1.45 0 1.9L9.25 16.9c-.77.49-1.75-.05-1.75-.95V5.4z"></path></svg>
                         Assistir filme
                     </a>
@@ -315,21 +405,36 @@
             <div class="space-y-3 pb-32">
                 {#each details.temporadas[activeSeasonIndex].episodios as episode (episode.path || episode.arquivo)}
                     {@const episodeKey = episode.path || episode.arquivo || episode.file}
-                    {@const progress = $watchHistory.get(episodeKey)}
-                    <div class="flex items-center space-x-4 p-3 bg-surface rounded-lg hover:bg-surface/80 transition-colors group">
+                    {@const progress = $watchHistory.get ? $watchHistory.get(episodeKey) : null}
+                    {@const watched = isEpisodeWatched(episodeKey)}
+                    <div class="flex items-center space-x-4 p-3 bg-surface rounded-lg hover:bg-surface/80 transition-colors group {currentPlaying === episodeKey ? 'ep-current-outline' : ''}">
                         <a
                             href={`/player?play=${encodeURIComponent(episode.path || episode.arquivo || episode.file)}&showCode=${encodeURIComponent(details.code)}`}
                             class="flex flex-1 items-center space-x-4 cursor-pointer overflow-hidden"
+                            on:click={() => onEpisodeClick(episode.path || episode.arquivo || episode.file)}
                             on:mousedown={() => handlePressStart(episode)} on:touchstart={() => handlePressStart(episode)}
                             on:mouseup={handlePressEnd} on:mouseleave={handlePressEnd} on:touchend={handlePressEnd}
                             on:click|capture={handleClick}
                         >
-                            <img
-                                src={ episode.thumbnail ? (episode.thumbnail.startsWith('http') ? episode.thumbnail : `${serverUrl}/midia/${episode.thumbnail}`) : `https://placehold.co/160x90/1a2923/ffffff?text=${encodeURIComponent((episode.arquivo || episode.file || '').replace('.mp4', ''))}` }
-                                alt="Thumbnail do episódio"
-                                class="h-16 w-28 flex-shrink-0 rounded-md bg-surface object-cover"
-                                loading="lazy"
-                            />
+                            <div class="ep-thumb-wrap">
+                                <img
+                                    src={ episode.thumbnail ? (episode.thumbnail.startsWith('http') ? episode.thumbnail : `${serverUrl}/midia/${episode.thumbnail}`) : `https://placehold.co/160x90/1a2923/ffffff?text=${encodeURIComponent((episode.arquivo || episode.file || '').replace('.mp4', ''))}` }
+                                    alt="Thumbnail do episódio"
+                                    class="h-16 w-28 flex-shrink-0 rounded-md bg-surface object-cover {watched ? 'ep-thumb-dim' : ''}"
+                                    loading="lazy"
+                                />
+                                {#if watched}
+                                    <div class="ep-watched-badge" title="Visto">
+                                        <Check class="h-4 w-4"/>
+                                    </div>
+                                {/if}
+                                {#if currentPlaying === episodeKey}
+                                    <div style="position:absolute;left:6px;bottom:6px;background:rgba(0,0,0,0.6);padding:4px;border-radius:6px;display:flex;align-items:center;gap:6px">
+                                        <Play class="h-3 w-3"/> Agora
+                                    </div>
+                                {/if}
+                            </div>
+
                             <div class="flex-1 min-w-0">
                                 <h4 class="font-semibold text-text-main overflow-hidden whitespace-nowrap text-ellipsis">
                                     { episode.titulo || episode.title || formatEpisodeNameFromAny(episode) }
@@ -347,6 +452,13 @@
                                 {/if}
                             </div>
                         </a>
+
+                        <!-- quick mark/unmark watched -->
+                        <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px">
+                            <button class="mark-btn" on:click={() => toggleManualWatched(episodeKey)}>
+                                {manualWatched && manualWatched[episodeKey] ? 'Desmarcar' : 'Marcar visto'}
+                            </button>
+                        </div>
                     </div>
                 {/each}
             </div>

@@ -23,8 +23,16 @@
 
   function onNext(event?: Event){
     event?.stopPropagation?.();
-    // apenas emite o evento 'next' — o handler no player fará a navegação
+
+    // índice do próximo episódio
+    const nextIndex = Number(currentItemIndex) + 1;
+
+    // manter compatibilidade com handlers existentes
     emit('next');
+
+    // garantir navegação imediata: emite select + playEpisode com o índice
+    emit('select', nextIndex);
+    emit('playEpisode', { index: nextIndex });
   }
 
   function onKey(e:KeyboardEvent){
