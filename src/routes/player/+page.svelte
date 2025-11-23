@@ -140,10 +140,10 @@
     }
 
     userHasInteracted.set(true);
-    
+
     // Tenta travar a orientação em paisagem em dispositivos móveis
     try { await lockLandscape(); } catch(e) {}
-    
+
     // Tenta entrar em tela cheia automaticamente após um breve atraso
     setTimeout(() => {
       if (playerContainer && playerContainer.requestFullscreen) {
@@ -213,7 +213,7 @@
    * @param showCode - O código do show/série para buscar a playlist completa.
    */
   async function loadVodPlaylist(baseUrl: string, currentPath: string, showCode: string | null) {
-    // Se não há um código de show, é um vídeo avulso.
+    // Se não há showCode, é um vídeo avulso.
     if (!showCode || showCode === 'undefined') {
       const finalVodPath = `${baseUrl}/midia/${currentPath}`;
       playlist = [{
@@ -221,17 +221,15 @@
         nome: formatEpisodeName(currentPath),
         tipo: 'desenho',
         duration: 0,
-        meta: { path: currentPath }
+        meta: { path: currentPath, poster: null, showName: null, descricao: null }
       }];
       currentItemIndex = 0;
-      // ... (lógica de fallback)
       return;
     }
 
-    // Busca os detalhes completos do show para montar a playlist de episódios.
     const resp = await fetch(`${baseUrl}/api/catalogo/${showCode}`);
     if (!resp.ok) throw new Error(`Falha ao buscar detalhes para o show ${showCode}`);
-    
+
     const data = await resp.json();
     if (!data.ok || !data.desenho) throw new Error(data.error || 'Resposta da API inválida.');
 
@@ -239,28 +237,56 @@
     const isMovie = !details.temporadas || details.temporadas.length === 0;
 
     if (isMovie) {
-      // Monta a playlist para um filme.
+      // Monta a playlist para um filme (item único).
+      const metaPath = details.path || (details.temporadas && details.temporadas[0]?.episodios?.[0]?.path) || currentPath;
       playlist = [{
-        src: `${baseUrl}/midia/${currentPath}`,
+        src: `${baseUrl}/midia/${metaPath}`,
         nome: details.nomeReal || 'Filme',
         tipo: 'desenho',
         duration: 0,
-        meta: { /* ... metadados ... */ }
+        meta: {
+          path: metaPath,
+          poster: details.poster || details.posterUrl || null,
+          showName: details.nomeReal || details.name || null,
+          descricao: details.descricao || details.overview || null
+        }
       }];
     } else {
-      // Monta a playlist para uma série, achatando todas as temporadas e episódios.
-      const episodesFlat = details.temporadas.flatMap(t => (t.episodios || []).map(ep => ({ ...ep, temporada: t.nome })));
+      // Monta a playlist para série — achata temporadas e episódios
+      const episodesFlat = details.temporadas.flatMap(t => (t.episodios || []).map(ep => ({
+        ...ep,
+        temporada: t.nome || t.name || `Temporada ${t.seasonNumber || ''}`
+      })));
+
       playlist = episodesFlat.map(ep => ({
-        src: `${baseUrl}/midia/${ep.path}`,
-        nome: ep.titulo || formatEpisodeName(ep.arquivo),
+        src: `${baseUrl}/midia/${ep.path || ep.arquivo || ep.file}`,
+        nome: ep.titulo || ep.title || formatEpisodeName(ep.arquivo || ep.file || ep.path),
         tipo: 'desenho',
         duration: 0,
-        meta: { /* ... metadados ... */ }
+        meta: {
+          path: ep.path || ep.arquivo || ep.file,
+          tituloEpisodio: ep.titulo || ep.title || null,
+          temporada: ep.temporada || null,
+          poster: ep.thumbnail || details.poster || details.posterUrl || null,
+          showName: details.nomeReal || details.name || null,
+          descricao: ep.sinopse || ep.synopsis || ep.overview || details.descricao || details.overview || null
+        }
       }));
     }
 
-    // Encontra o índice do episódio atual na playlist montada.
-    const idx = playlist.findIndex(p => p.meta?.path === currentPath);
+    // Encontra o índice do episódio atual:
+    // 1) tentativa exata
+    let idx = playlist.findIndex(p => p.meta?.path === currentPath);
+
+    // 2) fallback: comparar apenas basename (quando o backend/root path varia)
+    if (idx === -1) {
+      const targetBase = (currentPath || '').split('/').pop();
+      idx = playlist.findIndex(p => {
+        const mp = p.meta?.path || '';
+        return mp === currentPath || (mp && mp.split('/').pop() === targetBase);
+      });
+    }
+
     currentItemIndex = idx >= 0 ? idx : 0;
 
     if (!playlist[currentItemIndex]) {
@@ -416,13 +442,13 @@
   const toggleFullscreen = async () => {
     if (!document.fullscreenElement) {
       try { await lockLandscape(); } catch(e){}
-      try { 
-        if (playerContainer?.requestFullscreen) await playerContainer.requestFullscreen(); 
+      try {
+        if (playerContainer?.requestFullscreen) await playerContainer.requestFullscreen();
       } catch(e){ console.warn('toggleFullscreen falhou', e); }
     } else {
       try { await unlockOrientation(); } catch(e){}
-      try { 
-        if (document.fullscreenElement) await document.exitFullscreen(); 
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
       } catch(e){}
     }
   };
@@ -778,7 +804,10 @@
 
   function handlePauseOverlayNext(e: Event) {
     e?.stopPropagation?.();
-    performNextEpisode();
+    // executar em next tick evita problemas em que o primeiro clique só muda UI
+    setTimeout(() => {
+      performNextEpisode();
+    }, 0);
   }
 
   function handlePauseOverlaySelect(e: CustomEvent<number>) {
@@ -786,7 +815,7 @@
     e?.stopPropagation?.();
     const idx = Number(e.detail);
     if (!Number.isFinite(idx)) return;
-    performNextEpisode(idx);
+    setTimeout(() => performNextEpisode(idx), 0);
   }
 
   function handleOpenEpisodesFromOverlay(e: Event) {
