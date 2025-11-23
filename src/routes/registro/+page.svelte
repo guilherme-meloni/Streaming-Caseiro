@@ -1,0 +1,103 @@
+<script lang="ts">
+    import { goto } from '$app/navigation';
+    import { serverUrl } from '$lib/stores/settings';
+    import { auth } from '$lib/stores/auth';
+    import { onMount } from 'svelte';
+    import { browser } from '$app/environment';
+
+    let username = '';
+    let password = '';
+    let confirmPassword = '';
+    let error = '';
+    let isLoading = false;
+    let currentServerUrl = '';
+    let unsubscribeStore: () => void;
+
+    onMount(() => {
+        if (!browser) return;
+        unsubscribeStore = serverUrl.subscribe((value) => (currentServerUrl = value));
+    });
+
+    async function handleRegister() {
+        if (password !== confirmPassword) {
+            error = 'As senhas não coincidem.';
+            return;
+        }
+        isLoading = true;
+        error = '';
+
+        try {
+            const response = await fetch(`${currentServerUrl}/api/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || `Erro ${response.status}`);
+            
+            console.log('[REGISTRO] Usuário criado com token:', data.sessionToken?.substring(0, 20) + '...');
+            
+            // Já faz login automático após registro
+            if (data.sessionToken) {
+                auth.login({ id: data.user.id, username: data.user.username }, data.sessionToken);
+                goto('/hub');
+            } else {
+                alert('Usuário criado com sucesso! Agora você pode fazer o login.');
+                goto('/login');
+            }
+        } catch (e: any) {
+            console.error('[REGISTRO] Erro:', e);
+            error = e.message;
+        } finally {
+            isLoading = false;
+        }
+    }
+</script>
+
+<main class="flex h-screen w-full flex-col items-center justify-center bg-background p-4">
+    <div class="w-full max-w-sm text-center">
+        <div class="mb-6 text-6xl">📼</div>
+        <h1 class="font-display mb-8 text-4xl font-bold text-white">Criar Conta</h1>
+
+        <form on:submit|preventDefault={handleRegister} class="flex flex-col gap-4">
+            <input
+                bind:value={username}
+                type="text"
+                placeholder="Nome de usuário"
+                required
+                class="rounded-lg border-2 border-transparent bg-surface px-4 py-3 text-center text-lg text-white transition-colors focus:border-primary focus:outline-none"
+            />
+            <input
+                bind:value={password}
+                type="password"
+                placeholder="Senha"
+                required
+                class="rounded-lg border-2 border-transparent bg-surface px-4 py-3 text-center text-lg text-white transition-colors focus:border-primary focus:outline-none"
+            />
+            <input
+                bind:value={confirmPassword}
+                type="password"
+                placeholder="Confirme a senha"
+                required
+                class="rounded-lg border-2 border-transparent bg-surface px-4 py-3 text-center text-lg text-white transition-colors focus:border-primary focus:outline-none"
+            />
+
+            {#if error}
+                <p class="text-sm text-red-400">{error}</p>
+            {/if}
+
+            <button
+                type="submit"
+                disabled={isLoading}
+                class="mt-2 rounded-lg bg-primary py-3 font-bold text-white transition hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+                {isLoading ? 'Criando...' : 'Registrar'}
+            </button>
+        </form>
+
+        <p class="mt-6 text-sm text-subtle">
+            Já tem uma conta? <a href="/login" class="font-semibold text-primary hover:underline">Faça o login</a>
+        </p>
+    </div>
+</main>

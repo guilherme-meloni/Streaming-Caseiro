@@ -1,0 +1,359 @@
+<script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
+	import { browser } from '$app/environment';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { get } from 'svelte/store';
+	import { serverUrl } from '$lib/stores/settings';
+	import { userHasInteracted } from '$lib/stores/playerState';
+	import type { PlaylistItem } from '$lib/types';
+	import { getProgress, updateProgress } from '$lib/api';
+
+	import { PlayCircle, ArrowLeft, RotateCcw, FastForward } from 'lucide-svelte';
+	import PlayerControls from '$lib/components/streaming/PlayerControls.svelte';
+	import PauseOverlay from '$lib/components/streaming/PauseOverlay.svelte';
+	import NextEpisodesPanel from '$lib/components/streaming/NextEpisodesPanel.svelte';
+
+	// --- ESTADO DO PLAYER ---
+	let videoPlayer: HTMLVideoElement;
+	let playerContainer: HTMLDivElement;
+	let currentItem: PlaylistItem | null = null;
+	let playlist: PlaylistItem[] = [];
+	let currentItemIndex = -1;
+
+	// --- ESTADO DA UI ---
+	let isPlaying = false;
+	let currentTime = 0;
+	let duration = 0;
+	let volume = 0.7;
+	let isMuted = false;
+	let isFullscreen = false;
+	let playbackRate = 1;
+	let isLoading = true;
+	let showControls = true;
+	let controlsHideTimer: NodeJS.Timeout;
+
+	// --- SEEK / USER-DRAG STATE ---
+	let isUserSeeking = false; // control to avoid persisting on every move
+
+	// --- ESTADO DO PAINEL ARRASTÁVEL ---
+	let panelY = 0;
+	let isPanelDragging = false;
+	let startDragY = 0;
+	let panelOpen = false;
+	let panelHeight = 0;
+
+	// --- ESTADO DO DOUBLE-TAP ---
+	let lastTap = 0;
+	let tapTimeout: NodeJS.Timeout;
+	let seekIndicator: 'forward' | 'backward' | null = null;
+	let seekIndicatorTimer: NodeJS.Timeout;
+
+	// --- LÓGICA DE PERSISTÊNCIA ---
+	// ESTA ALTERAÇÃO: PLAYER PROGRESS
+	function throttle(func: (...args: any[]) => void, limit: number) {
+		let inThrottle: boolean;
+		return function (this: any, ...args: any[]) {
+			const context = this;
+			if (!inThrottle) {
+				func.apply(context, args);
+				inThrottle = true;
+				setTimeout(() => (inThrottle = false), limit);
+			}
+		};
+	}
+
+	// ESTA ALTERAÇÃO: PLAYER PROGRESS
+	// Implementa persistência do progresso: usa updateProgress (API) quando disponível,
+	// senão salva em localStorage como fallback em 'playback_{mediaId}'.
+	// NÃO altera shape de API se updateProgress existir.
+	async function persistProgress() {
+		try {
+			if (!videoPlayer) return;
+			const pos = Math.floor(videoPlayer.currentTime || 0);
+			const mediaId = $page.url.searchParams.get('play') || (currentItem && (currentItem.id || currentItem.src?.split('/').pop()));
+			if (!mediaId) return;
+
+			// Se existe updateProgress (importado), chama API. Caso falhe, faz fallback local.
+			try {
+				if (typeof updateProgress === 'function') {
+					// ESTA ALTERAÇÃO: PLAYER PROGRESS
+					await updateProgress(mediaId, pos, Math.floor(duration || 0));
+				} else {
+					throw new Error('updateProgress não disponível');
+				}
+			} catch (apiErr) {
+				// Fallback local
+				if (typeof window !== 'undefined') {
+					localStorage.setItem('playback_' + mediaId, JSON.stringify({ position: pos }));
+				}
+			}
+		} catch (err) {
+			console.error('persistProgress error', err);
+		}
+	}
+
+	const throttledPersistProgress = throttle(persistProgress, 1200);
+
+	// --- HANDLERS DE GESTO PARA O PAINEL ---
+	function handlePanelPointerDown(e: PointerEvent) {
+		// ESTA ALTERAÇÃO É VISUAL: evita iniciar arraste do painel quando interagimos com controles
+		if ((e.target as HTMLElement).closest('.player-controls')) return;
+		if (e.target instanceof HTMLInputElement || e.target instanceof HTMLButtonElement) return;
+		isPanelDragging = true;
+		startDragY = e.clientY;
+		playerContainer.style.cursor = 'grabbing';
+	}
+
+	function handlePanelPointerMove(e: PointerEvent) {
+		if (!isPanelDragging) return;
+		const currentY = e.clientY;
+		const deltaY = currentY - startDragY;
+		const newPanelY = (panelOpen ? 0 : panelHeight) + deltaY;
+		panelY = Math.max(0, Math.min(panelHeight, newPanelY));
+	}
+
+	function handlePanelPointerUp() {
+		isPanelDragging = false;
+		playerContainer.style.cursor = 'default';
+		if (panelY < panelHeight / 2) {
+			panelOpen = true;
+			panelY = 0;
+		} else {
+			panelOpen = false;
+			panelY = panelHeight;
+		}
+	}
+
+	// --- HANDLERS DE GESTO / DOUBLE-TAP (mantido) ---
+	function showSeekIndicator(direction: 'forward' | 'backward') {
+		seekIndicator = direction;
+		clearTimeout(seekIndicatorTimer);
+		seekIndicatorTimer = setTimeout(() => {
+			seekIndicator = null;
+		}, 600);
+	}
+
+	// Double-tap: continua funcionando, chama seek() (persist imediata).
+	function handleTap(e: MouseEvent) {
+		// Ignore taps on controls
+		if ((e.target as HTMLElement).closest('.player-controls')) return;
+
+		const now = Date.now();
+		const timeSinceLastTap = now - lastTap;
+
+		if (timeSinceLastTap < 300) {
+			clearTimeout(tapTimeout);
+			const rect = playerContainer.getBoundingClientRect();
+			const tapX = e.clientX - rect.left;
+			if (tapX < rect.width / 2) {
+				seek(Math.max(0, currentTime - 5));
+				showSeekIndicator('backward');
+			} else {
+				seek(Math.min(duration, currentTime + 5));
+				showSeekIndicator('forward');
+			}
+			persistProgress(); // envio imediato
+			lastTap = 0; // Reset tap
+		} else {
+			lastTap = now;
+			tapTimeout = setTimeout(() => {
+				showControlsAndResetTimer();
+			}, 300);
+		}
+	}
+
+	// --- HANDLERS DE EVENTOS DO VÍDEO ---
+	const onPlay = () => (isPlaying = true);
+	const onPause = () => {
+		isPlaying = false;
+		persistProgress();
+	};
+	const onEnded = () => {
+		isPlaying = false;
+		persistProgress();
+	};
+	const onTimeUpdate = () => {
+		// Atualiza posição UI (mas não persistimos aqui diretamente; usamos throttled)
+		currentTime = videoPlayer.currentTime;
+		duration = videoPlayer.duration;
+		// apenas persistir periodicamente
+		if (!isUserSeeking) throttledPersistProgress();
+	};
+	const onVolumeChange = () => {
+		volume = videoPlayer.volume;
+		isMuted = videoPlayer.muted;
+	};
+	const onLoadedMetadata = async () => {
+		duration = videoPlayer.duration;
+		videoPlayer.volume = volume;
+		videoPlayer.muted = isMuted;
+		if (isVodMode) {
+			const mediaId = $page.url.searchParams.get('play');
+			if (mediaId) {
+				const savedPosition = await getProgress(mediaId);
+				if (savedPosition > 5) videoPlayer.currentTime = savedPosition;
+			}
+		}
+	};
+
+	// --- FUNÇÕES DE CONTROLE DO PLAYER ---
+	const playPause = () => (videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause());
+	// seek usado programaticamente (keyboard, double-tap): aplica e persiste
+	const seek = (time: number) => {
+		if (!videoPlayer) return;
+		videoPlayer.currentTime = time;
+		currentTime = time;
+		persistProgress();
+	};
+	const setVolume = (vol: number) => (videoPlayer.volume = vol);
+	const toggleMute = () => (videoPlayer.muted = !videoPlayer.muted);
+	const setPlaybackRate = (rate: number) => {
+		videoPlayer.playbackRate = rate;
+		playbackRate = rate;
+	};
+	const toggleFullscreen = () => {
+		if (!document.fullscreenElement) playerContainer?.requestFullscreen();
+		else document.exitFullscreen();
+	};
+	const goBack = () => history.back();
+
+	function handleKeyDown(e: KeyboardEvent) {
+		if (e.key === ' ') {
+			e.preventDefault();
+			playPause();
+		} else if (e.key === 'ArrowRight') {
+			seek(Math.min(duration, currentTime + 5));
+		} else if (e.key === 'ArrowLeft') {
+			seek(Math.max(0, currentTime - 5));
+		}
+	}
+
+	function playCurrentVodItem() {
+		if (isVodMode && currentItemIndex !== -1 && playlist[currentItemIndex]) {
+			currentItem = playlist[currentItemIndex];
+			videoPlayer.src = currentItem.src;
+			videoPlayer.play().catch(e => console.error('Erro ao iniciar VOD:', e));
+		}
+	}
+
+	function handleSelectEpisode(newIndex: number) {
+		const selectedEpisode = playlist[newIndex];
+		if (selectedEpisode) {
+			goto(`/player?play=${selectedEpisode.src.split('/').pop()}`);
+		}
+		panelOpen = false;
+		panelY = panelHeight;
+	}
+
+	$: proximosDesenhos = isVodMode ? playlist.slice(currentItemIndex + 1, currentItemIndex + 5) : [];
+	$: hasNextEpisode = isVodMode && currentItemIndex < playlist.length - 1;
+
+	onMount(() => {
+		if (!browser) return;
+		panelHeight = window.innerHeight * 0.4;
+
+		document.addEventListener('fullscreenchange', () => (isFullscreen = !!document.fullscreenElement));
+		document.addEventListener('keydown', handleKeyDown);
+
+		const vodPathParam = $page.url.searchParams.get('play');
+		const currentServerUrl = get(serverUrl);
+
+		if (!currentServerUrl && !vodPathParam) {
+			goto('/login');
+			return;
+		}
+
+		if (vodPathParam) {
+			isVodMode = true;
+			isLoading = false;
+			const finalVodPath = `${currentServerUrl}/midia/${vodPathParam}`;
+			playlist = [{ src: finalVodPath, nome: 'Episódio', tipo: 'desenho', duration: 0 }];
+			currentItemIndex = 0;
+			playCurrentVodItem();
+		} else {
+			isVodMode = false;
+		}
+
+		panelY = panelHeight;
+
+		return () => {
+			document.removeEventListener('fullscreenchange', () => (isFullscreen = !!document.fullscreenElement));
+			document.removeEventListener('keydown', handleKeyDown);
+		};
+	});
+</script>
+
+<!-- O resto do template permanece praticamente igual -->
+<!-- Note que PlayerControls agora emite seekstart/seek/seekend -->
+<div
+	bind:this={playerContainer}
+	class="relative flex h-screen w-screen flex-col items-center justify-center overflow-hidden bg-black text-white"
+	on:pointerdown={handlePanelPointerDown}
+	on:pointermove={handlePanelPointerMove}
+	on:pointerup={handlePanelPointerUp}
+	on:pointerleave={handlePanelPointerUp}
+	aria-label="Player de vídeo"
+	role="application"
+	on:click={handleTap}
+>
+	{#if !$userHasInteracted && !isVodMode}
+		<!-- ... conteúdo de primeira interação ... -->
+	{/if}
+
+	<video
+		bind:this={videoPlayer}
+		on:play={onPlay}
+		on:pause={onPause}
+		on:ended={onEnded}
+		on:timeupdate={onTimeUpdate}
+		on:volumechange={onVolumeChange}
+		on:loadedmetadata={onLoadedMetadata}
+		class="h-full w-full object-contain {(!$userHasInteracted && !isVodMode ? 'blur-sm' : '')}"
+		autoplay
+		playsinline
+		muted={!$userHasInteracted && !isVodMode}
+	></video>
+
+	<!-- Controls / painel / next episodes -->
+	<PlayerControls
+		class="player-controls"
+		{isPlaying}
+		{currentTime}
+		{duration}
+		{volume}
+		{isMuted}
+		{isFullscreen}
+		{playbackRate}
+		on:playPause={playPause}
+		<!-- SEEK FLOW: start -> move -> end -->
+		on:seekstart={() => (isUserSeeking = true)}
+		on:seek={e => {
+			// feedback instantâneo (UI + player) sem persistir
+			if (videoPlayer) {
+				videoPlayer.currentTime = e.detail;
+				currentTime = e.detail;
+			}
+		}}
+		on:seekend={() => {
+			isUserSeeking = false;
+			// persistimos apenas no final do seek
+			persistProgress();
+		}}
+		on:setVolume={e => setVolume(e.detail)}
+		on:toggleMute={toggleMute}
+		on:setPlaybackRate={e => setPlaybackRate(e.detail)}
+		on:toggleFullscreen={toggleFullscreen}
+	/>
+	<NextEpisodesPanel
+		show={isVodMode}
+		y={panelY}
+		episodes={proximosDesenhos}
+		currentItemIndex={currentItemIndex}
+		on:close={() => {
+			panelOpen = false;
+			panelY = panelHeight;
+		}}
+		on:select={e => handleSelectEpisode(e.detail)}
+	/>
+</div>

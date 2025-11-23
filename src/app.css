@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    @apply bg-background text-text-main font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* LAYOUT-FIX-TOOL: START */
+:root {
+  --app-bottom-nav-height: 72px; /* aumentado para garantir distância do menu do SO */
+  /* CORREÇÃO: Unificado :root e usado fallback padrão para safe-area */
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+}
+
+/* main recebe padding extra para não ficar atrás do menu */
+.app-main { padding-bottom: calc(var(--safe-bottom) + var(--app-bottom-nav-height) + 8px); }
+.app-main { padding-bottom: calc(var(--safe-bottom, 0px) + var(--app-bottom-nav-height) + 8px); }
+
+/* mobile nav seguro */
+nav.fixed.bottom-0, .mobile-nav {
+  position: fixed !important;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(var(--app-bottom-nav-height) + var(--safe-bottom, 0px));
+  padding-bottom: var(--safe-bottom, 0px);
+  z-index: 60; /* sempre acima do conteúdo */
+}
+
+nav.fixed.bottom-0 a { padding-top: 12px; padding-bottom: calc(8px + var(--safe-bottom, 0px)); }
+
+/* vídeos: garantimos que não fiquem atrás do menu */
+.player-container video { max-height: calc(100vh - (var(--app-bottom-nav-height) + 140px)); height: auto; }
+
+/* imagens responsivas */
+img { max-width: 100%; height: auto; }
+
+/* modais: limitar altura e permitir scroll interno */
+.fixed.inset-0 > div, .fixed.inset-0 .max-w-2xl {
+  max-height: calc(100vh - 96px);
+  overflow: auto;
+}
+
+/* suaviza scrolls horizontais para mobile */
+.overflow-x-auto { -webkit-overflow-scrolling: touch; scroll-padding: 1rem; }
+
+/* melhora target/tap */
+a, button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+
+/* margens para modais */
+.fixed[role="dialog"] .max-w-2xl, .fixed[role="dialog"] > div { margin: 1rem; }
+
+
+
+
+

@@ -1,0 +1,1 @@
+Place placeholder images (e.g., placeholder1.webp, placeholder2.webp, etc.) in this directory. These images will be used by the offline fallback UI components.

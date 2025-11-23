@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Canal Nostalgia</string>
+    <string name="title_activity_main">Canal Nostalgia</string>
+    <string name="package_name">com.guilherme.canalnostalgia</string>
+    <string name="custom_url_scheme">com.guilherme.canalnostalgia</string>
+</resources>

@@ -1,0 +1,29 @@
+# Resumo dos Plugins do Capacitor
+
+Este arquivo resume a função de cada plugin do Capacitor encontrado no projeto.
+
+---
+
+- **@capacitor/action-sheet**: Mostra um menu de opções nativo que desliza de baixo para cima (ex: menu de compartilhamento).
+
+- **@capacitor/app-launcher**: Permite que seu app verifique se outro aplicativo está instalado e o abra.
+
+- **@capacitor/app**: Gerencia o estado geral do aplicativo (se está ativo, em segundo plano), lida com links de abertura (deep links) e controla o botão "voltar" do Android.
+
+- **@capacitor/background-runner**: Permite executar código JavaScript em segundo plano, mesmo com o app fechado, para tarefas periódicas como sincronização de dados.
+
+- **@capacitor/barcode-scanner**: Usa a câmera do dispositivo para escanear códigos de barras e QR codes.
+
+- **@capacitor/browser**: Abre links em um navegador interno (In-App Browser), mantendo o usuário dentro do seu aplicativo. Ideal para telas de login e notícias.
+
+- **@capacitor/camera**: Permite que o aplicativo tire fotos com a câmera ou escolha imagens existentes da galeria do usuário.
+
+- **@capacitor/clipboard**: Adiciona a funcionalidade de "copiar e colar" (para texto, imagens, etc.) na área de transferência do sistema.
+
+- **CapacitorCookies**: Melhora o gerenciamento de cookies, tratando-os no nível nativo para garantir que funcionem de forma mais confiável, especialmente em iOS.
+
+- **@capacitor/device**: Fornece informações detalhadas sobre o dispositivo do usuário: modelo, versão do SO, nível da bateria, fabricante, ID único, etc.
+
+- **@capacitor/dialog**: Permite exibir caixas de diálogo nativas do sistema, como alertas (`alert`), confirmações (`confirm`) e prompts para o usuário digitar algo.
+
+- **@capacitor/filesystem**: Fornece uma API para trabalhar com o sistema de arquivos do dispositivo. Permite ler, escrever, deletar e gerenciar arquivos e pastas.

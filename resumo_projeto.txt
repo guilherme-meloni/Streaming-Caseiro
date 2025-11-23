@@ -1,0 +1,127 @@
+# Resumo Detalhado do Projeto: Backend e Comunicação Frontend-Backend
+
+Este documento resume a arquitetura, lógica e comunicação do seu projeto, com foco nas funcionalidades analisadas e modificadas.
+
+## 1. Visão Geral do Backend
+
+O backend é uma aplicação Node.js/TypeScript com uma estrutura modular, organizada da seguinte forma:
+
+*   **`src/server.ts`**: Ponto de entrada principal da aplicação, inicializa o servidor HTTP e o WebSocket.
+*   **`src/config.ts`**: Contém configurações globais da aplicação (ex: `MIDIA_URL`, `MIDIA_PATH`).
+*   **`src/api/`**: Lida com rotas de API REST (ex: `routes.ts` para autenticação, `streaming.ts` para streaming de mídia).
+*   **`src/core/`**: Contém a lógica de negócio central da aplicação.
+    *   `auth.ts`: Lógica de autenticação (usando Lucia).
+    *   `playback.ts`: Gerencia o estado de reprodução (VOD e canal 24H).
+    *   `scheduler.ts`: **Crucial para o Canal 24H**, gerencia a grade de programação.
+    *   `streamManager.ts`: Gerencia sessões de streaming.
+*   **`src/routes/`**: Define as rotas da API.
+*   **`src/services/`**: Módulos que fornecem funcionalidades específicas ou interagem com recursos externos.
+    *   `database.ts`: Conexão e operações com o banco de dados (SQLite via Drizzle ORM).
+    *   `mediaScanner.ts`: Escaneia arquivos de mídia.
+    *   `historyManager.ts`: Gerencia o histórico de visualização.
+    *   `userProgress.ts`: Gerencia o progresso do usuário.
+    *   `schema.ts`: Define o esquema do banco de dados.
+*   **`src/scripts/`**: Scripts utilitários para manutenção, enriquecimento de dados, etc. (ex: `build-cache.ts`, `enrich-episodes.ts`).
+*   **`src/types/`**: Definições de tipos TypeScript.
+*   **`src/utils/`**: Funções utilitárias gerais (ex: `fileUtils.ts`, `logger.ts`).
+*   **`src/websocket/handler.ts`**: **Crucial para a comunicação em tempo real**, lida com as conexões e mensagens WebSocket.
+
+## 2. Lógica do Canal 24H (Backend)
+
+O "Canal 24h" é uma funcionalidade de streaming contínuo, gerenciada principalmente por `src/core/scheduler.ts` e `src/websocket/handler.ts`.
+
+### 2.1. `src/core/scheduler.ts`
+
+*   **Geração da Grade (`generate24hSchedule`)**: Seleciona aleatoriamente séries/episódios marcados como `vodOnly: false` do banco de dados para criar uma playlist de 24 horas.
+*   **Persistência da Grade**:
+    *   A grade gerada é salva em `grades_salvas/daily_schedule.json` (via `saveSchedule`).
+    *   Na inicialização, o sistema tenta carregar uma grade existente (`loadSchedule`).
+    *   Uma nova grade só é gerada se não houver uma grade salva, se a grade salva for de um dia anterior, ou se a grade atual tiver expirado (terminado há mais de 1 hora). Isso garante que a grade seja gerada apenas uma vez por dia e reutilizada.
+*   **Controle de Espectadores (`handle24hViewerConnection`, `handle24hViewerDisconnection`)**: Inicia o canal quando o primeiro espectador se conecta e o coloca em standby quando não há mais espectadores.
+*   **Estado Atual (`get24hCurrentPlayback`)**: Calcula qual item da grade deve estar sendo reproduzido no momento, com base no `scheduleStartTime` e na duração dos itens.
+*   **Forçar Nova Grade (`forceGenerateNewSchedule`)**: Uma função adicionada para permitir a geração manual de uma nova grade, útil para administração.
+
+### 2.3. `src/websocket/handler.ts`
+
+Este arquivo atua como a ponte entre o frontend e o scheduler para o canal 24H.
+
+*   **Início do Canal**: Quando um cliente envia o comando `{"type": "COMMAND", "command": "SWITCH_CHANNEL", "channel": "main"}`, o `handle24hViewerConnection()` do scheduler é chamado, iniciando o processo de geração/carregamento da grade.
+*   **Envio de Stream**: Após a grade ser gerada (`schedulerEvents.on('schedule-generated')`), o backend envia mensagens WebSocket do tipo `stream` (com a URL do vídeo) e `nowPlaying` (com metadados) para os clientes conectados ao canal principal. Isso faz com que o player do frontend comece a reproduzir o conteúdo.
+*   **Comandos de Controle**:
+    *   `NEXT`: Comando para avançar para o próximo item na grade (lógica de avanço para o canal 24H ainda pendente de implementação no `playback.ts` ou `scheduler.ts`).
+    *   `GENERATE_NEW_SCHEDULE`: Comando para forçar a geração de uma nova grade 24H (chama `forceGenerateNewSchedule()` do scheduler).
+
+## 3. Comunicação Frontend-Backend (WebSocket)
+
+A comunicação em tempo real entre o frontend (o player Svelte) e o backend é feita via WebSocket.
+
+*   **Conexão**: O frontend (`src/routes/player/+page.svelte`) estabelece uma conexão WebSocket com o backend (`ws://<server_url>/ws`).
+*   **Autenticação**: O token de autenticação deve ser enviado na URL do WebSocket (ex: `ws://.../ws?token=SEU_TOKEN`) para que o backend possa autenticar o usuário.
+*   **Comandos do Frontend**: O frontend envia mensagens JSON do tipo `COMMAND` para o backend para controlar o canal:
+    *   `{"type": "COMMAND", "command": "SWITCH_CHANNEL", "channel": "main"}`: Inicia a visualização do canal 24H.
+    *   `{"type": "COMMAND", "command": "NEXT"}`: Solicita o próximo item na grade.
+    *   `{"type": "COMMAND", "command": "GENERATE_NEW_SCHEDULE"}`: Solicita a geração de uma nova grade.
+*   **Eventos do Backend**: O backend envia mensagens JSON para o frontend para atualizar o estado do player:
+    *   `{"type": "stream", "url": "..."}`: Informa a URL do vídeo a ser reproduzido.
+    *   `{"type": "nowPlaying", "meta": {...}}`: Fornece metadados do item atual.
+    *   `{"type": "GRADE_UPDATE", "payload": {...}}`: Atualiza a grade completa e o estado de reprodução.
+    *   `{"type": "STATS_UPDATE", "payload": {...}}`: Envia estatísticas do sistema.
+
+## 4. Lógica de Token (Autenticação)
+
+*   **Biblioteca**: Utiliza `lucia-auth` para gerenciamento de sessões e autenticação.
+*   **Token de Sessão**: Após o login, um `sessionToken` é gerado e associado a uma sessão no banco de dados.
+*   **Fornecimento**: O `src/websocket/handler.ts` tenta ler o token de:
+    1.  Parâmetro `token` na query string da URL WebSocket.
+    2.  Cookie `auth_session`.
+    3.  Header `Authorization: Bearer`.
+*   **Recomendação**: Para o player Svelte, o token deve ser incluído na query string da URL WebSocket ao estabelecer a conexão.
+
+## 5. Scripts de Gerenciamento (Shell)
+
+Vários scripts shell (`.sh`) são usados para tarefas de gerenciamento e manutenção da biblioteca de mídia.
+
+*   **`assistente.sh` (v11.0)**: O assistente principal e mais recente. Interage com o TMDB para catalogar séries/filmes e chama scripts TypeScript do backend para enriquecimento de dados. **ESSENCIAL.**
+*   **`assistente_final.sh` (v5.0)**: Versão mais antiga, mas com módulos adicionais (organização de inbox, recodificação, renomeação, correção de áudio, downloader). **AVALIAR** se as funcionalidades exclusivas ainda são necessárias.
+*   **`assistente_midia.sh` (v4.2)**: Versão mais antiga e redundante. **PODE APAGAR.**
+*   **`fix_*.sh` (ex: `fix_doctor_who.sh`, `fix_json_whitespace.sh`, `fix_movie_folders.sh`, `fix-names.sh`, `update_catalog_codes.sh`)**: Scripts de correção e padronização pontuais. **PODE APAGAR COM RESSALVA** se os problemas que eles corrigem já foram resolvidos e não se espera que reapareçam.
+*   **`reencode_folder_to_h264.sh`**: Script de recodificação de vídeo. **AVALIAR** se sua funcionalidade é duplicada por assistentes ou se é preferível como ferramenta autônoma.
+*   **`treecat.sh`**: Gera um resumo da estrutura do projeto. **PODE APAGAR** se não for mais necessário.
+
+## 6. Recomendações de Exclusão de Arquivos/Diretórios
+
+**Pode Apagar com Segurança:**
+
+*   `node_modules_old_1758673739/`
+*   `dist/`
+*   Arquivos `.bak` em `control_ui/`
+*   `assistente_midia.sh` (v4.2)
+*   `assistente (another copy).sh`, `assistente (copy).sh`
+*   `fix_doctor_who.sh`
+*   `treecat.sh`
+*   `_inbox/` (se vazio)
+*   `meu_gdrive` (se vazio)
+*   `meu-canal-local-servidor@1.0.0` (se vazio)
+
+**Pode Apagar com Ressalva (Avalie seu uso):**
+
+*   Arquivos `.txt` de documentação/notas (ex: `analise_do_caso.txt`, `INSTRUCOES.txt`, `projeto.txt`, `resumo_codigo.txt`)
+*   `fix_json_whitespace.sh`
+*   `fix_movie_folders.sh`
+*   `fix-names.sh`
+*   `reencode_folder_to_h264.sh`
+*   `update_catalog_codes.sh`
+
+**NÃO Apagar (Essenciais ou Requerem Investigação Profunda):**
+
+*   `src/` (e todo o seu conteúdo)
+*   `package.json`, `pnpm-lock.yaml`, `tsconfig.json`
+*   `.env`, `.dockerignore`, `Dockerfile`, `docker-compose.yml`, `.gitignore`
+*   `canal_nostalgia.db`
+*   `metadata.cache.json`, `movie_paths.json`, `user_progress.json`
+*   `user_data/`, `midia/`, `guia/`
+*   `control_ui/index.html`
+*   `assistente.sh` (v11.0)
+*   `fs` (arquivo grande, propósito desconhecido - **INVESTIGAR ANTES DE APAGAR**)
+*   `grades_pool/` (grades geradas, possível cache - **INVESTIGAR ANTES DE APAGAR**)
+*   `grades_salvas/` (grades salvas, prováveis dados persistentes - **INVESTIGAR ANTES DE APAGAR**)

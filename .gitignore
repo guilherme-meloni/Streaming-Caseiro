@@ -1,0 +1,36 @@
+# Dependências do Node
+/node_modules
+/.pnpm
+.pnpm-debug.log
+
+# Cache e Saídas de Build do SvelteKit / Vite
+/.svelte-kit
+/build
+/.vite
+
+# Saídas de Build do Electron
+/dist
+/electron/build/
+/electron/dist/
+
+# Dependências aninhadas
+/electron/node_modules
+
+# Arquivos de Sistema Operacional
+.DS_Store
+Thumbs.db
+
+# Variáveis de Ambiente
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Configurações de IDE
+.idea/
+.vscode/

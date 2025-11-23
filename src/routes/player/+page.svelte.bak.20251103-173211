@@ -1,0 +1,578 @@
+<script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
+	import { browser } from '$app/environment';
+	import { page as pageStore } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { get } from 'svelte/store';
+	import { serverUrl } from '$lib/stores/settings';
+	import { userHasInteracted } from '$lib/stores/playerState';
+	import type { PlaylistItem, ShowDetails } from '$lib/types';
+	import { getProgress, updateProgress } from '$lib/api';
+
+	import { createEventDispatcher } from 'svelte';
+	import { PlayCircle, ArrowLeft } from 'lucide-svelte';
+	import PlayerControls from '$lib/components/streaming/PlayerControls.svelte';
+	import PauseOverlay from '$lib/components/streaming/PauseOverlay.svelte';
+	import NextEpisodesPanel from '$lib/components/streaming/NextEpisodesPanel.svelte';
+
+	const dispatch = createEventDispatcher();
+
+	// --- ESTADO DO PLAYER ---
+	let videoPlayer: HTMLVideoElement;
+	let playerContainer: HTMLDivElement;
+	let currentItem: PlaylistItem | null = null;
+	let playlist: PlaylistItem[] = [];
+	let currentItemIndex = -1;
+
+	// --- ESTADO DA UI ---
+	let isPlaying = false;
+	let currentTime = 0;
+	let duration = 0;
+	let volume = 0.7;
+	let isMuted = false;
+	let isFullscreen = false;
+	let playbackRate = 1;
+	let isLoading = true;
+	let showControls = true;
+	let showNextEpisodes = false;
+	let controlsHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// Feedback visual do pulo de 5s
+	let skipFlash: { dir: 'back' | 'forward'; visible: boolean } = { dir: 'forward', visible: false };
+	let skipFlashTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// Gestos (sheet)
+	let touchStartY: number | null = null;
+	const SWIPE_THRESHOLD = 40;
+
+	// Double-tap
+	let lastTapLeft = 0;
+	let lastTapRight = 0;
+	const DOUBLE_TAP_MS = 300;
+
+	// --- CONEXÃO (CANAL 24h) ---
+	let isVodMode = false;
+	let socket: WebSocket | null = null;
+	let connectionStatus = 'Aguardando configuração...';
+	let reconnectAttempts = 0;
+	let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+
+	// progresso VOD
+	let saveTimer: ReturnType<typeof setTimeout> | null = null;
+	let currentMediaId: string | null = null;
+
+	// acesso reativo a $page
+	$: page = $pageStore;
+
+	// ------- URL helper -------
+	function toWsUrl(baseHttpUrl: string, wsPath: string): string {
+		const base = new URL(baseHttpUrl);
+		const protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+		const cleanPath = wsPath.startsWith('/') ? wsPath : `/${wsPath}`;
+		return `${protocol}//${base.host}${cleanPath}`;
+	}
+	function resolveWsUrl(baseHttpUrl: string): string {
+		const abs = (import.meta as any).env?.VITE_WS_ABSOLUTE as string | undefined;
+		if (abs) return abs;
+		const path = ((import.meta as any).env?.VITE_WS_PATH as string) || '/ws/emissora';
+		return toWsUrl(baseHttpUrl, path);
+	}
+
+	// util
+	const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+	const formatEpisodeName = (filename: string): string => {
+		const match = filename?.match(/E(\d+)/i);
+		return match ? `Episódio ${parseInt(match[1], 10)}` : (filename?.replace?.('.mp4', '') ?? 'Episódio');
+	};
+
+	// ---------------- Ciclo de vida ----------------
+	onMount(() => {
+		if (!browser) return;
+
+		const fsHandler = () => (isFullscreen = !!document.fullscreenElement);
+		document.addEventListener('fullscreenchange', fsHandler);
+
+		const vodPathParam = page.url.searchParams.get('play');      // episode.path
+		const showCode = page.url.searchParams.get('showCode');      // code da série
+		const currentServer = get(serverUrl);
+
+		if (!currentServer && !vodPathParam) {
+			goto('/login');
+			return;
+		}
+
+		if (vodPathParam) {
+			// --------- VOD com possível showCode: monta playlist completa ----------
+			isVodMode = true;
+			isLoading = true;
+			loadVodPlaylist(currentServer!, vodPathParam, showCode)
+				.then(() => {
+					playCurrentVodItem();
+					isLoading = false;
+				})
+				.catch((e) => {
+					console.error('[VOD] Falha ao montar playlist:', e);
+					// fallback simples: tocar só esse arquivo
+					const finalVodPath = `${currentServer}/midia/${vodPathParam}`;
+					playlist = [{
+						src: finalVodPath,
+						nome: 'Episódio',
+						tipo: 'desenho',
+						duration: 0,
+						meta: { path: vodPathParam }
+					}];
+					currentItemIndex = 0;
+					currentMediaId = vodPathParam;
+					playCurrentVodItem();
+					isLoading = false;
+				});
+		} else {
+			// --------- Canal 24h via WebSocket ----------
+			isVodMode = false;
+			connectToEmissora(currentServer!);
+			isLoading = false;
+		}
+
+		// salvar progresso ao sair (apenas VOD)
+		const beforeUnload = () => {
+			trySaveProgressNow();
+		};
+		window.addEventListener('beforeunload', beforeUnload);
+
+		onDestroy(() => {
+			if (socket) socket.close();
+			if (heartbeatTimer) clearTimeout(heartbeatTimer);
+			if (saveTimer) clearTimeout(saveTimer);
+			if (controlsHideTimer) clearTimeout(controlsHideTimer);
+			if (skipFlashTimer) clearTimeout(skipFlashTimer);
+			document.removeEventListener('fullscreenchange', fsHandler);
+			window.removeEventListener('beforeunload', beforeUnload);
+		});
+	});
+
+	// ---------------- Monta playlist completa a partir do showCode ----------------
+	async function loadVodPlaylist(baseUrl: string, currentPath: string, showCode: string | null) {
+		const finalVodPath = `${baseUrl}/midia/${currentPath}`;
+		if (!showCode) {
+			playlist = [{
+				src: finalVodPath,
+				nome: 'Episódio',
+				tipo: 'desenho',
+				duration: 0,
+				meta: { path: currentPath }
+			}];
+			currentItemIndex = 0;
+			currentMediaId = currentPath;
+			return;
+		}
+
+		const resp = await fetch(`${baseUrl}/api/catalogo/${encodeURIComponent(showCode)}`);
+		if (!resp.ok) throw new Error('Falha na comunicação com o servidor para detalhes da série.');
+		const data = await resp.json();
+		if (!data.ok || !data.desenho) throw new Error(data.error || 'Detalhes da série indisponíveis.');
+
+		const details: ShowDetails = data.desenho;
+
+		const episodesFlat = details.temporadas.flatMap((t) =>
+			t.episodios.map((ep) => ({ temporada: t.nome, ...ep }))
+		);
+
+		playlist = episodesFlat.map((ep) => ({
+			src: `${baseUrl}/midia/${ep.path}`,
+			nome: ep.titulo || formatEpisodeName(ep.arquivo),
+			tipo: 'desenho',
+			duration: 0,
+			meta: {
+				descricao: ep.sinopse,
+				poster: ep.thumbnail,
+				tituloEpisodio: ep.titulo || formatEpisodeName(ep.arquivo),
+				path: ep.path,
+				temporada: ep.temporada
+			}
+		}));
+
+		const idx = playlist.findIndex((p) => p.meta?.path === currentPath);
+		currentItemIndex = idx >= 0 ? idx : 0;
+		currentMediaId = playlist[currentItemIndex]?.meta?.path || currentPath;
+
+		currentItem = playlist[currentItemIndex];
+		if (videoPlayer) videoPlayer.src = playlist[currentItemIndex].src;
+	}
+
+	// ---------------- Progresso VOD ----------------
+	function scheduleSaveProgress() {
+		if (!isVodMode || !currentMediaId) return;
+		if (saveTimer) clearTimeout(saveTimer);
+		// salva 10s após a última atualização (debounce)
+		saveTimer = setTimeout(async () => {
+			try {
+				await updateProgress(
+					currentMediaId!,
+					Math.floor(videoPlayer?.currentTime || 0),
+					Number.isFinite(videoPlayer?.duration) ? Math.floor(videoPlayer.duration) : 0
+				);
+			} catch (e) {
+				console.warn('[VOD] Falha ao salvar progresso:', e);
+			}
+		}, 10000);
+	}
+	async function trySaveProgressNow() {
+		if (!isVodMode || !currentMediaId) return;
+		try {
+			await updateProgress(
+				currentMediaId!,
+				Math.floor(videoPlayer?.currentTime || 0),
+				Number.isFinite(videoPlayer?.duration) ? Math.floor(videoPlayer.duration) : 0
+			);
+		} catch {}
+	}
+
+	// ---------------- UI ----------------
+	function showControlsAndResetTimer() {
+		showControls = true;
+		if (controlsHideTimer) clearTimeout(controlsHideTimer);
+		controlsHideTimer = setTimeout(() => (showControls = false), 3000);
+	}
+
+	const onPlay = () => (isPlaying = true);
+	const onPause = () => (isPlaying = false);
+	const onTimeUpdate = () => {
+		currentTime = videoPlayer.currentTime || 0;
+		duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : 0;
+		if (isVodMode) scheduleSaveProgress();
+	};
+	const onVolumeChange = () => {
+		volume = videoPlayer.volume;
+		isMuted = videoPlayer.muted;
+	};
+	const onLoadedMetadata = async () => {
+		duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : 0;
+		videoPlayer.volume = volume;
+		videoPlayer.muted = isMuted;
+		// restaura progresso salvo (VOD)
+		if (isVodMode && currentMediaId) {
+			try {
+				const savedPosition = await getProgress(currentMediaId);
+				if (savedPosition > 5 && savedPosition < duration) {
+					videoPlayer.currentTime = savedPosition;
+				}
+			} catch (e) {
+				console.warn('[VOD] getProgress falhou:', e);
+			}
+		}
+	};
+
+	// ---------------- Controles player ----------------
+	const playPause = () => (videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause());
+	const seek = (time: number) => {
+		const d = Number.isFinite(duration) ? duration : videoPlayer.duration || 0;
+		videoPlayer.currentTime = Math.max(0, Math.min(d || Infinity, time));
+	};
+	const nudge = (delta: number) => {
+		seek((videoPlayer?.currentTime || 0) + delta);
+		showSkipFlash(delta);
+	};
+	const setVolume = (vol: number) => (videoPlayer.volume = Math.max(0, Math.min(1, vol)));
+	const toggleMute = () => (videoPlayer.muted = !videoPlayer.muted);
+	const setPlaybackRate = (rate: number) => {
+		videoPlayer.playbackRate = rate;
+		playbackRate = rate;
+	};
+	const toggleFullscreen = () => {
+		if (!document.fullscreenElement) playerContainer?.requestFullscreen();
+		else document.exitFullscreen();
+	};
+	const goBack = () => history.back();
+
+	function playCurrentVodItem() {
+		if (isVodMode && currentItemIndex !== -1 && playlist[currentItemIndex]) {
+			currentItem = playlist[currentItemIndex];
+			currentMediaId = currentItem.meta?.path || null;
+			videoPlayer.src = currentItem.src;
+			videoPlayer.play().catch(async () => {
+				await sleep(300);
+				videoPlayer.play().catch((e) => console.error('Erro ao iniciar VOD:', e));
+			});
+		}
+	}
+
+	// ---------------- WebSocket (CANAL) ----------------
+	function startHeartbeat() {
+		stopHeartbeat();
+		const tick = () => {
+			try {
+				if (socket?.readyState === WebSocket.OPEN) {
+					socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+				}
+			} catch {}
+			heartbeatTimer = setTimeout(tick, 15000);
+		};
+		heartbeatTimer = setTimeout(tick, 15000);
+	}
+	function stopHeartbeat() {
+		if (heartbeatTimer) {
+			clearTimeout(heartbeatTimer);
+			heartbeatTimer = null;
+		}
+	}
+	function scheduleReconnect(baseUrl: string) {
+		reconnectAttempts++;
+		const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts));
+		setTimeout(() => connectToEmissora(baseUrl), delay);
+	}
+	function connectToEmissora(baseUrl: string) {
+		const wsUrl = resolveWsUrl(baseUrl);
+		connectionStatus = 'Conectando à emissora...';
+
+		try {
+			socket = new WebSocket(wsUrl);
+		} catch (e) {
+			connectionStatus = 'Falha ao criar conexão WebSocket.';
+			scheduleReconnect(baseUrl);
+			return;
+		}
+
+		socket.onopen = () => {
+			connectionStatus = 'Conectado à emissora.';
+			reconnectAttempts = 0;
+			startHeartbeat();
+			try {
+				socket?.send(JSON.stringify({ type: 'hello', client: 'pwa', ts: Date.now() }));
+			} catch {}
+		};
+
+		socket.onmessage = (ev) => {
+			let data: any = null;
+			try {
+				data = JSON.parse(ev.data);
+			} catch {}
+			if (!data) return;
+			handleWsMessage(data);
+		};
+
+		socket.onerror = () => {
+			connectionStatus = 'Erro na conexão com a emissora.';
+		};
+
+		socket.onclose = () => {
+			connectionStatus = 'Desconectado. Tentando reconectar...';
+			stopHeartbeat();
+			scheduleReconnect(baseUrl);
+		};
+	}
+	function handleWsMessage(msg: any) {
+		switch (msg?.type) {
+			case 'stream':
+				if (typeof msg.url === 'string' && msg.url) {
+					if (videoPlayer.src !== msg.url) {
+						videoPlayer.src = msg.url;
+						videoPlayer.play().catch((e) => console.error('Erro ao iniciar stream:', e));
+					}
+					isLoading = false;
+				}
+				break;
+			case 'playlist':
+				if (Array.isArray(msg.items)) {
+					playlist = msg.items;
+				}
+				break;
+			case 'nowPlaying':
+				if (msg.meta) {
+					currentItem = {
+						src: videoPlayer.src,
+						nome: msg.meta.titulo || 'Ao vivo',
+						tipo: 'canal',
+						duration: 0,
+						meta: msg.meta
+					};
+				}
+				break;
+			case 'ping':
+				try { socket?.send(JSON.stringify({ type: 'pong', ts: Date.now() })); } catch {}
+				break;
+			default:
+				break;
+		}
+	}
+
+	// ---------------- Próximos episódios (VOD) ----------------
+	$: proximosDesenhos = isVodMode ? playlist.slice(currentItemIndex + 1, currentItemIndex + 12) : [];
+	$: hasNextEpisode = isVodMode && currentItemIndex < playlist.length - 1;
+
+	// ---------------- Feedback skip ----------------
+	function showSkipFlash(delta: number) {
+		if (skipFlashTimer) clearTimeout(skipFlashTimer);
+		skipFlash.dir = delta >= 0 ? 'forward' : 'back';
+		skipFlash.visible = true;
+		skipFlashTimer = setTimeout(() => (skipFlash.visible = false), 350);
+	}
+
+	// ---------------- Gestos ----------------
+	function handleLeftDblClick() { nudge(-5); }
+	function handleRightDblClick() { nudge(+5); }
+	function onTouchEndLeft() {
+		const now = Date.now();
+		if (now - lastTapLeft < DOUBLE_TAP_MS) { nudge(-5); lastTapLeft = 0; }
+		else { lastTapLeft = now; }
+	}
+	function onTouchEndRight() {
+		const now = Date.now();
+		if (now - lastTapRight < DOUBLE_TAP_MS) { nudge(+5); lastTapRight = 0; }
+		else { lastTapRight = now; }
+	}
+	function onPlayerTouchStart(e: TouchEvent) {
+		if (e.touches.length !== 1) return;
+		touchStartY = e.touches[0].clientY;
+	}
+	function onPlayerTouchEnd(e: TouchEvent) {
+		if (touchStartY === null) return;
+		const endY = e.changedTouches[0].clientY;
+		const deltaY = touchStartY - endY; // >0 = arrastou pra cima
+		if (!showNextEpisodes && deltaY > SWIPE_THRESHOLD) {
+			showNextEpisodes = true;
+		} else if (showNextEpisodes && -deltaY > SWIPE_THRESHOLD) {
+			showNextEpisodes = false;
+		}
+		touchStartY = null;
+	}
+</script>
+
+<!-- LAYOUT -->
+<div
+	bind:this={playerContainer}
+	role="application"
+	class="relative flex h-screen w-screen select-none flex-col items-center justify-center overflow-hidden bg-black text-white touch-manipulation"
+	on:mousemove={showControlsAndResetTimer}
+	on:click={showControlsAndResetTimer}
+	on:touchstart={onPlayerTouchStart}
+	on:touchend={onPlayerTouchEnd}
+>
+	{#if !$userHasInteracted && !isVodMode}
+		<!-- Primeira interação -->
+		<div
+			class="absolute inset-0 z-50 flex cursor-pointer flex-col items-center justify-center gap-4 p-4 text-center"
+			on:click={() => userHasInteracted.set(true)}
+			on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && userHasInteracted.set(true)}
+			role="button"
+			tabindex="0"
+		>
+			<PlayCircle class="h-24 w-24 text-white drop-shadow-2xl" />
+			<h1 class="text-4xl font-bold drop-shadow-lg">Tocar para Iniciar</h1>
+		</div>
+	{/if}
+
+	<!-- Vídeo -->
+	<video
+		bind:this={videoPlayer}
+		on:play={onPlay}
+		on:pause={onPause}
+		on:timeupdate={onTimeUpdate}
+		on:volumechange={onVolumeChange}
+		on:loadedmetadata={onLoadedMetadata}
+		class="h-full w-full object-contain {(!$userHasInteracted && !isVodMode) ? 'blur-sm' : ''}"
+		autoplay
+		playsinline
+		muted={!$userHasInteracted && !isVodMode}
+	></video>
+
+	<!-- Áreas de gesto: double-tap esquerda/direita -->
+	{#if $userHasInteracted || isVodMode}
+		<div class="pointer-events-auto absolute inset-0 z-10">
+			<div
+				class="absolute inset-y-0 left-0 w-1/2"
+				on:dblclick|stopPropagation={handleLeftDblClick}
+				on:touchend|stopPropagation={onTouchEndLeft}
+				aria-label="Voltar 5 segundos"
+			/>
+			<div
+				class="absolute inset-y-0 right-0 w-1/2"
+				on:dblclick|stopPropagation={handleRightDblClick}
+				on:touchend|stopPropagation={onTouchEndRight}
+				aria-label="Avançar 5 segundos"
+			/>
+		</div>
+
+		{#if skipFlash.visible}
+			<div class="pointer-events-none absolute inset-0 z-20">
+				{#if skipFlash.dir === 'back'}
+					<div class="absolute left-6 top-1/2 -translate-y-1/2 rounded-xl bg-black/60 px-4 py-3 text-2xl font-bold backdrop-blur-md animate-pulse">
+						-5s
+					</div>
+				{:else}
+					<div class="absolute right-6 top-1/2 -translate-y-1/2 rounded-xl bg-black/60 px-4 py-3 text-2xl font-bold backdrop-blur-md animate-pulse">
+						+5s
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{/if}
+
+	<!-- Overlays/Controles -->
+	{#if $userHasInteracted || isVodMode}
+		<div class="absolute inset-0 z-10 {showControls ? 'opacity-100' : 'opacity-0'} transition-opacity duration-300">
+			<button
+				on:click={goBack}
+				class="absolute left-4 top-4 z-20 flex h-12 w-12 items-center justify-center rounded-full bg-black/50 transition-colors hover:bg-black/75"
+			>
+				<ArrowLeft class="h-6 w-6" />
+			</button>
+
+			{#if !isPlaying && duration > 0}
+				<PauseOverlay
+					title={currentItem?.nome}
+					synopsis={currentItem?.meta?.descricao}
+					nextEpisodes={proximosDesenhos}
+					currentItemIndex={currentItemIndex}
+					on:continue={playPause}
+					on:next={() => {
+						if (currentItemIndex < playlist.length - 1) {
+							currentItemIndex += 1;
+							playCurrentVodItem();
+						}
+					}}
+					on:selectEpisode={(e) => {
+						currentItemIndex = e.detail;
+						playCurrentVodItem();
+					}}
+				/>
+			{/if}
+
+			<PlayerControls
+				{isPlaying}
+				{currentTime}
+				{duration}
+				{volume}
+				{isMuted}
+				{isFullscreen}
+				{playbackRate}
+				on:playPause={playPause}
+				on:seek={(e) => seek(e.detail)}
+				on:setVolume={(e) => setVolume(e.detail)}
+				on:toggleMute={toggleMute}
+				on:setPlaybackRate={(e) => setPlaybackRate(e.detail)}
+				on:toggleFullscreen={toggleFullscreen}
+				on:openEpisodes={() => (showNextEpisodes = true)}
+				on:skipBack={() => nudge(-5)}
+				on:skipForward={() => nudge(+5)}
+			/>
+		</div>
+
+		<!-- handle do sheet -->
+		<div class="absolute bottom-0 left-1/2 z-10 -translate-x-1/2 pb-2 {showControls ? 'opacity-100' : 'opacity-0'} transition-opacity" aria-hidden="true">
+			<div class="mx-auto h-1.5 w-16 rounded-full bg-white/70" />
+		</div>
+
+		{#if showNextEpisodes}
+			<NextEpisodesPanel
+				episodes={proximosDesenhos}
+				currentItemIndex={currentItemIndex}
+				on:close={() => (showNextEpisodes = false)}
+				on:select={(e) => {
+					currentItemIndex = e.detail;
+					playCurrentVodItem();
+					showNextEpisodes = false;
+				}}
+			/>
+		{/if}
+	{/if}
+</div>

@@ -1,0 +1,539 @@
+<script lang="ts">
+    import { onMount, onDestroy } from 'svelte';
+    import { serverUrl } from '$lib/stores/settings';
+    import type { PlaylistItem, GradeUpdatePayload } from '$lib/types';
+    import { browser } from '$app/environment';
+    import { goto } from '$app/navigation';
+    import { fade, fly, scale } from 'svelte/transition';
+    import { page } from '$app/stores';
+    import { userHasInteracted } from '$lib/stores/playerState';
+    import { get } from 'svelte/store';
+    import { PlayCircle, SkipForward, RefreshCw, Tv, X, Maximize, Minimize } from 'lucide-svelte';
+    import { Filesystem, Directory } from '@capacitor/filesystem';
+    import { Capacitor } from '@capacitor/core';
+
+    // --- ESTADO DO COMPONENTE ---
+    let videoPlayer: HTMLVideoElement;
+    let playerContainer: HTMLDivElement;
+    let isFullscreen = false;
+    let currentItem: PlaylistItem | null = null;
+    let socket: WebSocket;
+    let isLoading = true;
+    let connectionStatus = 'Aguardando configuração...';
+    let isVodMode = false;
+
+    // --- ESTADO DO CANAL 24H ---
+    let playlist: PlaylistItem[] = [];
+    let currentItemIndex = -1;
+    let itemStartTime = 0;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 12;
+    let currentChannel = 'main';
+    let availableChannels: GradeUpdatePayload['availableChannels'] = [];
+    let isChannelSelectorOpen = false;
+    let selectedItemForModal: PlaylistItem | null = null;
+    let heartbeatIntervalId: NodeJS.Timeout;
+    let upNextCheckInterval: NodeJS.Timeout;
+    let showUpNextPopup = false;
+    let upNextItem: PlaylistItem | null = null;
+
+    // --- FUNÇÃO DE TELA CHEIA ---
+    function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+            playerContainer?.requestFullscreen();
+        } else {
+            if (document.exitFullscreen) document.exitFullscreen();
+        }
+    }
+
+    function onFullscreenChange() {
+        isFullscreen = !!document.fullscreenElement;
+    }
+
+    // --- LIFECYCLE ---
+    onMount(() => {
+        if (!browser) return;
+
+        document.addEventListener('fullscreenchange', onFullscreenChange);
+
+        const vodPathParam = $page.url.searchParams.get('play');
+        const offlinePathParam = $page.url.searchParams.get('playOffline');
+        const currentServerUrl = get(serverUrl);
+
+        if (!currentServerUrl && !offlinePathParam) {
+            goto('/login');
+            return;
+        }
+
+        if (offlinePathParam) {
+            isVodMode = true;
+            isLoading = false;
+            connectionStatus = 'Modo Offline';
+            playOfflineVideo(offlinePathParam);
+        } else if (vodPathParam) {
+            isVodMode = true;
+            isLoading = false;
+            connectionStatus = 'Modo Vídeo On Demand';
+            videoPlayer.src = `${currentServerUrl}/midia/${vodPathParam}`;
+        } else {
+            isVodMode = false;
+            connectToEmissora(currentServerUrl);
+            setupUpNextCheck();
+        }
+
+        return () => {
+            if (socket) socket.close();
+            if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
+            if (upNextCheckInterval) clearInterval(upNextCheckInterval);
+            document.removeEventListener('fullscreenchange', onFullscreenChange);
+        };
+    });
+
+    // --- FUNÇÕES DE LÓGICA ---
+    async function playOfflineVideo(localPath: string) {
+        try {
+            const { uri } = await Filesystem.getUri({
+                path: localPath,
+                directory: Directory.Data
+            });
+            videoPlayer.src = Capacitor.convertFileSrc(uri);
+        } catch (e) {
+            console.error('Erro ao carregar vídeo offline', e);
+            connectionStatus = 'Erro ao carregar vídeo offline.';
+        }
+    }
+
+    function connectToEmissora(url: string) {
+        const domain = url.replace(/^http?:\/\//, '');
+        const WS_URL = `ws://${domain}`;
+        isLoading = true;
+        connectionStatus = `Conectando à emissora...`;
+        socket = new WebSocket(WS_URL);
+
+        socket.onopen = () => {
+            reconnectAttempts = 0;
+            isLoading = false;
+            connectionStatus = 'Conectado';
+            heartbeatIntervalId = setInterval(() => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({ type: 'PING' }));
+                }
+            }, 20000);
+            const channelFromUrl = $page.url.searchParams.get('channel');
+            if (channelFromUrl) {
+                switchChannel(channelFromUrl);
+                const newUrl = new URL(window.location.href);
+                newUrl.searchParams.delete('channel');
+                history.replaceState({}, '', newUrl);
+            }
+        };
+
+        socket.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'GRADE_UPDATE') {
+                handleGradeUpdate(message.payload);
+            }
+            if (message.type === 'COMMAND' && videoPlayer) {
+                console.log('Comando de controle remoto recebido:', message.command);
+                switch (message.command) {
+                    case 'PLAY_PAUSE':
+                        videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause();
+                        break;
+                    case 'VOLUME_UP':
+                        videoPlayer.volume = Math.min(1, videoPlayer.volume + 0.1);
+                        break;
+                    case 'VOLUME_DOWN':
+                        videoPlayer.volume = Math.max(0, videoPlayer.volume - 0.1);
+                        break;
+                    case 'REWIND':
+                        videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime - 10);
+                        break;
+                }
+            }
+        };
+
+        socket.onclose = () => {
+            isLoading = true;
+            if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = 5000;
+                connectionStatus = `Conexão perdida. Reconectando em ${delay / 1000}s...`;
+                setTimeout(() => connectToEmissora(url), delay);
+            } else {
+                connectionStatus = 'Falha ao reconectar.';
+            }
+        };
+        socket.onerror = () => (connectionStatus = 'Erro de conexão.');
+    }
+
+    function handleGradeUpdate(payload: GradeUpdatePayload) {
+        const itemChanged =
+            payload.currentItemIndex !== currentItemIndex || currentChannel !== payload.channelMode;
+        playlist = payload.grade || [];
+        currentItemIndex = payload.currentItemIndex;
+        itemStartTime = payload.itemStartTime;
+        currentChannel = payload.channelMode || 'main';
+        availableChannels = payload.availableChannels || [];
+        if (get(userHasInteracted) && currentItemIndex >= 0) {
+            applyUpdateToPlayer(itemChanged);
+        }
+    }
+
+    function applyUpdateToPlayer(itemChanged = false) {
+        if (isVodMode || !videoPlayer || currentItemIndex < 0 || !playlist[currentItemIndex]) return;
+        const newItem = playlist[currentItemIndex];
+        const srcChanged = currentItem?.src !== newItem.src;
+        currentItem = newItem;
+        if (srcChanged || itemChanged) videoPlayer.src = currentItem.src;
+        const serverElapsed = (Date.now() - itemStartTime) / 1000;
+        let targetTime = Math.max(0, serverElapsed - 2);
+        if (currentItem.start) targetTime += currentItem.start;
+
+        const seek = () => {
+            if (videoPlayer && Math.abs(videoPlayer.currentTime - targetTime) > 2.5) {
+                videoPlayer.currentTime = targetTime;
+            }
+            videoPlayer?.play().catch(() => {});
+        };
+        if (videoPlayer && videoPlayer.readyState >= 2) seek();
+        else if (videoPlayer) videoPlayer.onloadeddata = seek;
+    }
+
+    function handleFirstInteraction() {
+        if (get(userHasInteracted)) return;
+        userHasInteracted.set(true);
+        if (videoPlayer) {
+            videoPlayer.muted = false;
+            videoPlayer.play().catch(() => {});
+        }
+    }
+
+    function sendCommand(command: string, data = {}) {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'COMMAND', command, ...data }));
+        }
+    }
+
+    function switchChannel(channelCode: string) {
+        sendCommand('SWITCH_CHANNEL', { channel: channelCode });
+        isChannelSelectorOpen = false;
+    }
+
+    function setupUpNextCheck() {
+        if (upNextCheckInterval) clearInterval(upNextCheckInterval);
+        upNextCheckInterval = setInterval(() => {
+            const currentLiveItem = playlist[currentItemIndex];
+            if (isVodMode || !currentLiveItem || !itemStartTime || currentLiveItem.tipo !== 'desenho') {
+                if (showUpNextPopup) showUpNextPopup = false;
+                return;
+            }
+            const elapsedSeconds = (Date.now() - itemStartTime) / 1000;
+            const totalDuration = currentLiveItem.duration;
+            const timeLeft = totalDuration - elapsedSeconds;
+
+            if (timeLeft <= 60 && timeLeft > 5) {
+                if (!showUpNextPopup) {
+                    const nextCartoon = playlist.slice(currentItemIndex + 1).find((item) => item.tipo === 'desenho');
+                    if (nextCartoon) {
+                        upNextItem = nextCartoon;
+                        showUpNextPopup = true;
+                    }
+                }
+            } else {
+                if (showUpNextPopup) showUpNextPopup = false;
+            }
+        }, 1000);
+    }
+
+    const formatDuration = (seconds: number) => {
+        if (!seconds || seconds < 60) return `${Math.round(seconds || 0)}s`;
+        return `${Math.round(seconds / 60)}min`;
+    };
+
+    $: proximosDesenhos = playlist
+        .slice(currentItemIndex + 1)
+        .filter((item) => item && item.tipo === 'desenho')
+        .slice(0, 5);
+</script>
+
+<style>
+    video::-webkit-media-controls-fullscreen-button {
+        display: none;
+    }
+</style>
+
+<main class="relative h-full w-full overflow-hidden bg-black">
+    {#if !$userHasInteracted}
+        <div
+            class="absolute inset-0 z-50 flex cursor-pointer flex-col items-center justify-center gap-4 bg-gradient-to-b from-background to-black p-4 text-center"
+            on:click={handleFirstInteraction}
+            on:keydown|once|self={() => {}}
+            role="button"
+            tabindex="0"
+        >
+            <PlayCircle class="h-24 w-24 text-primary drop-shadow-2xl" />
+            <h1 class="font-display text-4xl font-bold text-white drop-shadow-lg">Pronto para assistir?</h1>
+            <p class="max-w-md text-lg text-subtle">
+                {#if isVodMode}
+                    Toque para iniciar seu episódio.
+                {:else if !isLoading}
+                    Toque para iniciar a transmissão com som.
+                {/if}
+            </p>
+            {#if !isVodMode}
+                <div class="mt-6 flex items-center justify-center gap-2 rounded-full bg-black/30 px-4 py-2 backdrop-blur-md">
+                    <span
+                        class="h-3 w-3 rounded-full {isLoading
+                            ? 'animate-pulse bg-yellow-400'
+                            : 'bg-green-400'}"
+                    ></span>
+                    <span class="text-sm font-medium text-white">{connectionStatus}</span>
+                </div>
+            {/if}
+        </div>
+    {/if}
+
+    <div
+        class="grid h-full w-full"
+        class:blur-sm={!$userHasInteracted}
+        class:pointer-events-none={!$userHasInteracted}
+        class:md:grid-cols-1={isVodMode}
+        class:md:grid-cols-[1fr_384px]={!isVodMode}
+    >
+        <div bind:this={playerContainer} class="group relative flex items-center justify-center bg-black">
+            <video
+                bind:this={videoPlayer}
+                class="h-full w-full object-contain"
+                autoplay
+                playsinline
+                controls
+                muted={!$userHasInteracted}
+            ></video>
+
+            {#if $userHasInteracted}
+                <div
+                    class="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-full bg-black/60 p-2 opacity-0 backdrop-blur-xl transition-opacity group-hover:opacity-100"
+                >
+                    {#if !isVodMode}
+                        <button
+                            on:click={() => sendCommand('REGENERATE_TODAY')}
+                            aria-label="Recriar Grade"
+                            class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
+                        >
+                            <RefreshCw class="h-5 w-5 text-white" />
+                        </button>
+                        <button
+                            on:click={() => sendCommand('NEXT')}
+                            aria-label="Pular Desenho"
+                            class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
+                        >
+                            <SkipForward class="h-5 w-5 text-white" />
+                        </button>
+                    {/if}
+                    <button
+                        on:click={toggleFullscreen}
+                        aria-label="Tela Cheia"
+                        class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
+                    >
+                        {#if isFullscreen}
+                            <Minimize class="h-5 w-5 text-white" />
+                        {:else}
+                            <Maximize class="h-5 w-5 text-white" />
+                        {/if}
+                    </button>
+                </div>
+            {/if}
+
+            {#if !isVodMode && showUpNextPopup && upNextItem}
+                <div
+                    transition:scale={{ duration: 400, start: 0.9 }}
+                    class="absolute bottom-20 left-4 right-4 z-30 mx-auto max-w-md overflow-hidden rounded-2xl bg-gradient-to-br from-black/90 to-black/70 shadow-2xl backdrop-blur-xl md:left-8 md:right-auto md:bottom-24"
+                >
+                    <div class="flex gap-4 p-4">
+                        <img
+                            src={upNextItem.meta?.poster || 'https://placehold.co/120x180/1a2923/8f9e98?text=?'}
+                            alt="Pôster de {upNextItem.nome}"
+                            class="h-32 w-20 flex-shrink-0 rounded-lg object-cover shadow-lg"
+                        />
+                        <div class="flex flex-col justify-center">
+                            <p class="font-display text-xs font-bold uppercase tracking-wider text-primary">
+                                A Seguir
+                            </p>
+                            <h3 class="font-display mt-1 text-xl font-bold leading-tight text-white">
+                                {upNextItem.nome}
+                            </h3>
+                            {#if upNextItem.meta?.tituloEpisodio}
+                                <p class="mt-1 text-sm text-white/70">{upNextItem.meta.tituloEpisodio}</p>
+                            {/if}
+                            <div class="mt-2 flex items-center gap-2 text-xs text-white/60">
+                                <span class="rounded bg-white/10 px-2 py-0.5">{upNextItem.tipo?.toUpperCase()}</span>
+                                <span>•</span>
+                                <span>{formatDuration(upNextItem.duration)}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            {/if}
+        </div>
+
+        {#if !isVodMode}
+            <aside class="hidden flex-col gap-6 overflow-y-auto bg-surface p-6 md:flex">
+                {#if currentItem}
+                    <button
+                        on:click={() => (selectedItemForModal = currentItem)}
+                        class="block w-full rounded-xl border border-on-subtle/30 bg-gradient-to-br from-background to-surface p-4 text-left shadow-lg transition-all hover:border-primary/50 hover:shadow-xl active:scale-98"
+                    >
+                        <div class="flex gap-4">
+                            <img
+                                src={currentItem.meta?.poster ||
+                                    'https://placehold.co/80x120/1a2923/8f9e98?text=?'}
+                                alt="Pôster de {currentItem.nome}"
+                                class="h-32 w-20 flex-shrink-0 rounded-lg bg-background object-cover shadow-md"
+                            />
+                            <div class="min-w-0">
+                                <span class="font-display text-xs font-bold uppercase tracking-wider text-primary">NO AR AGORA</span>
+                                <h2 class="font-display mt-1 truncate text-xl font-bold">{currentItem.nome}</h2>
+                                <p class="mt-1 truncate text-sm text-subtle">
+                                    {currentItem.meta?.tituloEpisodio || ' '}
+                                </p>
+                                <div class="mt-3 flex gap-2 text-xs text-subtle">
+                                                                            <span class="rounded-full bg-on-subtle/30 px-2 py-0.5">{currentItem.tipo?.toUpperCase()}</span>                                    <span class="flex items-center gap-1">
+                                        <span class="h-1 w-1 rounded-full bg-subtle"></span>
+                                        {formatDuration(currentItem.duration)}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    </button>
+                {/if}
+                <div>
+                    <h3
+                        class="font-display mb-4 border-b border-on-subtle/30 pb-2 text-sm font-bold uppercase tracking-wider text-subtle"
+                    >
+                        Próximos Episódios
+                    </h3>
+                    <div class="flex flex-col gap-2">
+                        {#each proximosDesenhos as item (item.src)}
+                            <button
+                                on:click={() => (selectedItemForModal = item)}
+                                class="group/card flex items-center gap-4 rounded-xl border border-transparent p-3 text-left transition-all hover:border-primary/30 hover:bg-on-subtle/20 active:scale-98"
+                            >
+                                <img
+                                    src={item.meta?.poster || 'https://placehold.co/112x64/1a2923/8f9e98?text=?'}
+                                    alt="Pôster de {item.nome}"
+                                    class="h-16 w-28 flex-shrink-0 rounded-lg bg-background object-cover shadow-md"
+                                />
+                                <div class="min-w-0 flex-1">
+                                    <p class="truncate font-semibold">{item.nome}</p>
+                                    <span class="text-xs text-primary">{formatDuration(item.duration)}</span>
+                                </div>
+                            </button>
+                        {:else}
+                            <p class="p-4 text-center text-sm text-subtle">Carregando programação...</p>
+                        {/each}
+                    </div>
+                </div>
+            </aside>
+        {/if}
+    </div>
+
+    {#if !isVodMode}
+        {#if selectedItemForModal}
+            <div
+                transition:fade={{ duration: 200 }}
+                class="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4 backdrop-blur-md"
+                on:click={() => (selectedItemForModal = null)}
+                on:keydown|self={() => {}}
+                role="dialog"
+                tabindex="-1"
+            >
+                                <div
+                    transition:scale={{ duration: 300, start: 0.95 }}
+                    class="flex w-full max-w-2xl flex-col gap-4 overflow-hidden rounded-2xl border border-on-subtle/30 bg-gradient-to-br from-surface to-background shadow-2xl md:flex-row"
+                    on:click|stopPropagation
+                    role="document"
+                >
+                    <img
+                        src={selectedItemForModal.meta?.poster}
+                        alt="Poster"
+                        class="h-64 w-full object-cover md:h-auto md:w-56"
+                    />
+                    <div class="flex flex-col p-6">
+                        <h2 class="font-display text-2xl font-bold">{selectedItemForModal.nome}</h2>
+                        {#if selectedItemForModal.meta?.tituloEpisodio}
+                            <p class="font-semibold text-primary">{selectedItemForModal.meta.tituloEpisodio}</p>
+                        {/if}
+                        <p class="mt-4 flex-grow text-subtle">
+                            {selectedItemForModal.meta?.descricao || 'Nenhuma descrição disponível.'}
+                        </p>
+                        <div class="mt-4 text-xs text-subtle">
+                            <span>{selectedItemForModal.meta?.ano || '----'}</span>
+                            <span class="mx-2">•</span>
+                            <span>{selectedItemForModal.meta?.genero || 'Desconhecido'}</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        {/if}
+
+        {#if isChannelSelectorOpen}
+            <div
+                transition:fade={{ duration: 200 }}
+                on:click={() => (isChannelSelectorOpen = false)}
+                on:keydown|self={() => {}}
+                class="fixed inset-0 z-50 flex items-end justify-center bg-black/80 backdrop-blur-md sm:items-center"
+                role="dialog"
+                tabindex="-1"
+            >
+                                <div
+                    transition:fly={{ y: 50, duration: 300 }}
+                    on:click|stopPropagation
+                    class="w-full max-w-md rounded-t-2xl border-t border-on-subtle/30 bg-gradient-to-b from-surface to-background shadow-2xl sm:rounded-2xl sm:border"
+                    role="document"
+                >
+                    <div class="flex items-center justify-between border-b border-on-subtle/30 p-4">
+                        <h2 class="font-display text-lg font-bold">Mudar de Canal</h2>
+                        <button
+                            on:click={() => (isChannelSelectorOpen = false)}
+                            class="rounded-full p-2 text-subtle transition-colors hover:bg-white/10"
+                            aria-label="Fechar"
+                        >
+                            <X />
+                        </button>
+                    </div>
+                    <div class="flex max-h-[60vh] flex-col gap-2 overflow-y-auto p-4">
+                        <button
+                            on:click={() => switchChannel('main')}
+                            class="flex w-full items-center gap-4 rounded-xl border border-transparent p-4 text-left transition-all {currentChannel ===
+                            'main'
+                                ? 'border-primary bg-primary/20 text-primary'
+                                : 'hover:border-on-subtle/30 hover:bg-on-subtle/10'}"
+                        >
+                            <Tv class="h-6 w-6" />
+                            <div>
+                                <p class="font-bold">Canal Principal</p>
+                                <p class="text-sm text-subtle">Programação variada</p>
+                            </div>
+                        </button>
+                        {#each availableChannels as channel (channel.code)}
+                            <button
+                                on:click={() => switchChannel(channel.code)}
+                                class="flex w-full items-center gap-4 rounded-xl border border-transparent p-4 text-left transition-all {currentChannel ===
+                                channel.code
+                                    ? 'border-primary bg-primary/20 text-primary'
+                                    : 'hover:border-on-subtle/30 hover:bg-on-subtle/10'}"
+                            >
+                                <span class="text-2xl">🎬</span>
+                                <div>
+                                    <p class="font-bold">{channel.nome}</p>
+                                    <p class="text-sm text-subtle">{channel.totalEpisodios} episódios</p>
+                                </div>
+                            </button>
+                        {/each}
+                    </div>
+                </div>
+            </div>
+        {/if}
+    {/if}
+</main>

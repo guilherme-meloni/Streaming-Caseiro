@@ -1,0 +1,91 @@
+# Plugins do Capacitor: Tradução e Explicação
+
+Este arquivo contém a tradução e uma explicação simplificada dos plugins do Capacitor listados no arquivo `plugins_capacitor.txt`.
+
+---
+
+### PLUGINS OFICIAIS
+
+---
+
+#### **@capacitor/action-sheet**
+
+*   **Tradução:** A API de Action Sheet (Folha de Ações) fornece acesso a Folhas de Ações nativas, que surgem da parte inferior da tela e exibem ações que um usuário pode tomar.
+*   **Explicação:** Use este plugin para mostrar uma lista de opções em um menu que desliza de baixo para cima. É ideal para ações como "Upload", "Compartilhar", "Remover", etc.
+
+---
+
+#### **@capacitor/app-launcher**
+
+*   **Tradução:** A API AppLauncher permite que seu aplicativo verifique se outro aplicativo pode ser aberto e o abra.
+*   **Explicação:** Útil para interagir com outros aplicativos instalados no dispositivo. Você pode verificar se o app do Facebook está instalado e abri-lo diretamente em uma página específica, por exemplo.
+
+---
+
+#### **@capacitor/app**
+
+*   **Tradução:** A API App lida com o estado e eventos de alto nível do aplicativo. Por exemplo, emite eventos quando o aplicativo entra e sai do primeiro plano, lida com deep links, abre outros aplicativos e gerencia o estado persistente dos plugins.
+*   **Explicação:** Essencial para gerenciar o ciclo de vida do seu aplicativo. Com ele, você pode saber se o app está ativo, pausado (em segundo plano) ou sendo aberto por um link customizado (ex: `meuapp://pagina`). Também permite controlar o botão "Voltar" no Android.
+
+---
+
+#### **@capacitor/background-runner**
+
+*   **Tradução:** O Background Runner fornece um ambiente JavaScript autônomo baseado em eventos para executar seu código JavaScript fora da visualização da web.
+*   **Explicação:** Permite executar tarefas em segundo plano mesmo quando o aplicativo está fechado. Por exemplo, você pode usá-lo para verificar novos dados de um servidor a cada 15 minutos, sincronizar arquivos ou reagir a notificações push silenciosas.
+
+---
+
+#### **@capacitor/barcode-scanner**
+
+*   **Tradução:** Um plugin do Capacitor que utiliza as bibliotecas de código de barras da Outsystems.
+*   **Explicação:** Permite que seu aplicativo use a câmera do dispositivo para escanear diferentes tipos de códigos de barras e QR codes.
+
+---
+
+#### **@capacitor/browser**
+
+*   **Tradução:** A API Browser oferece a capacidade de abrir um navegador dentro do aplicativo e se inscrever em eventos do navegador.
+*   **Explicação:** Use para abrir links externos em uma janela de navegador que fica dentro do seu próprio aplicativo (In-App Browser), em vez de mandar o usuário para o Chrome ou Safari. Isso mantém o usuário no contexto do seu app e é muito usado para telas de login OAuth.
+
+---
+
+#### **@capacitor/camera**
+
+*   **Tradução:** A API da Câmera oferece a capacidade de tirar uma foto com a câmera ou escolher uma existente do álbum de fotos.
+*   **Explicação:** Permite que o usuário tire fotos ou escolha imagens da galeria do celular. É um dos plugins mais comuns para aplicativos que precisam de upload de imagens.
+
+---
+
+#### **@capacitor/clipboard**
+
+*   **Tradução:** A API de Clipboard (Área de Transferência) permite copiar e colar de/para a área de transferência do sistema.
+*   **Explicação:** Um plugin simples para dar ao seu aplicativo a funcionalidade de "copiar e colar" texto, imagens ou URLs.
+
+---
+
+#### **CapacitorCookies**
+
+*   **Tradução:** A API Capacitor Cookies fornece suporte nativo a cookies, "remendando" o `document.cookie` para usar bibliotecas nativas. Também fornece métodos para modificar cookies em uma URL específica.
+*   **Explicação:** Melhora o gerenciamento de cookies, especialmente em iOS, onde há mais restrições. Ele faz com que os cookies funcionem de forma mais confiável, tratando-os no nível nativo em vez de apenas no nível do navegador/webview.
+
+---
+
+#### **@capacitor/device**
+
+*   **Tradução:** A API Device expõe informações internas sobre o dispositivo, como o modelo e a versão do sistema operacional, juntamente com informações do usuário, como IDs únicos.
+*   **Explicação:** Use para obter informações sobre o celular do usuário: modelo, fabricante, sistema operacional (iOS/Android), nível da bateria, se está carregando, e um ID único do dispositivo para aquela instalação do app.
+
+---
+
+#### **@capacitor/dialog**
+
+*   **Tradução:** A API Dialog fornece métodos para acionar janelas de diálogo nativas para alertas, confirmações e prompts de entrada.
+*   **Explicação:** Permite mostrar caixas de diálogo nativas do sistema, como `alert()` (um alerta simples), `confirm()` (com botões OK/Cancelar) e `prompt()` (para o usuário digitar algo).
+
+---
+
+#### **@capacitor/filesystem**
+
+*   **Tradução:** A API Filesystem fornece uma API semelhante ao NodeJS para trabalhar com arquivos no dispositivo.
+*   **Explicação:** Essencial para gerenciar arquivos no armazenamento do dispositivo. Com ele, você pode ler, escrever, deletar e gerenciar pastas e arquivos em diferentes diretórios (como Documentos, Cache, etc.). A funcionalidade de download de arquivos foi movida para o plugin `@capacitor/file-transfer`.
