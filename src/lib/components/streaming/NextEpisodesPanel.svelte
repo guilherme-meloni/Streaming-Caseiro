@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { slide, fade } from 'svelte/transition';
-  import { X, Play } from 'lucide-svelte';
+  import { X, Check, Play } from 'lucide-svelte';
   import type { PlaylistItem } from '$lib/types';
 
   export let episodes: PlaylistItem[] = [];
@@ -15,7 +15,7 @@
 
   function episodeSort(a: PlaylistItem, b: PlaylistItem) {
     const getNum = (ep: PlaylistItem) => {
-      const n = ep.meta?.episodio || ep.meta?.numero || (ep.meta?.tituloEpisodio || ep.nome).match(/E(\d+)/i)?.[1];
+      const n = ep.meta?.episodio || ep.meta?.numero || (ep.meta?.tituloEpisodio || ep.nome)?.match?.(/E(\d+)/i)?.[1];
       const v = n ? parseInt(n, 10) : NaN;
       return Number.isFinite(v) ? v : Infinity;
     };
@@ -39,7 +39,13 @@
   })(episodes);
 
   let selectedSeason = 0;
+
   function selectSeason(i: number) { selectedSeason = i; }
+
+  function selectEpisodeByIndex(idx: number) {
+    emit('select', idx);
+    emit('playEpisode', { index: idx });
+  }
 
   function absoluteIndexFor(ep: PlaylistItem) {
     return episodes.findIndex(e => e.meta?.path === ep.meta?.path);
@@ -47,30 +53,34 @@
 
   function close() { emit('close'); }
 
-  // nowPlaying from localStorage (only used to display "Agora")
+  // local watch markers + nowPlaying (same keys as DetailsPage)
+  const LS_MANUAL_KEY = 'manualWatched_v1';
   const LS_NOWPLAYING = 'nowPlaying';
+  let manualWatched: Record<string, boolean> = {};
   let nowPlaying: string | null = null;
+
+  function loadManualWatched() {
+    try {
+      const raw = localStorage.getItem(LS_MANUAL_KEY);
+      manualWatched = raw ? JSON.parse(raw) : {};
+    } catch (e) { manualWatched = {}; }
+  }
   function loadNowPlaying() {
     try { nowPlaying = localStorage.getItem(LS_NOWPLAYING); } catch(e) { nowPlaying = null; }
   }
-
-  $: loadNowPlaying();
-
-  // ao selecionar um episódio: garante nowPlaying (localStorage) e emite select+playEpisode imediatamente
-  function selectEpisodeByIndex(idx: number) {
-    if (idx == null || idx < 0 || idx >= episodes.length) return;
-    const ep = episodes[idx];
-    const epPath = ep.meta?.path;
-    try {
-      if (epPath) localStorage.setItem(LS_NOWPLAYING, epPath);
-      nowPlaying = epPath ?? null;
-    } catch(e){}
-    // emitir eventos que o +page.svelte já escuta e também o event global
-    emit('select', idx);
-    emit('playEpisode', { index: idx });
+  function toggleManualWatched(epPath: string) {
+    if (!epPath) return;
+    manualWatched = { ...(manualWatched || {}) };
+    manualWatched[epPath] = !manualWatched[epPath];
+    try { localStorage.setItem(LS_MANUAL_KEY, JSON.stringify(manualWatched)); } catch(e){}
   }
 
-  // touch/drag handling preserved from original...
+  $: {
+    loadManualWatched();
+    loadNowPlaying();
+  }
+
+  // drag/close handling (preservado)
   let startX: number | null = null;
   let startY: number | null = null;
   let panelEl: HTMLDivElement;
@@ -104,16 +114,10 @@
     const dy = e.touches[0].clientY - startY;
     if (dragDirection === 'none') {
       if (Math.abs(dx) > DIRECTION_THRESHOLD || Math.abs(dy) > DIRECTION_THRESHOLD) {
-        if (Math.abs(dx) > Math.abs(dy)) {
-          dragDirection = 'horizontal';
-        } else {
-          dragDirection = 'vertical';
-        }
+        dragDirection = Math.abs(dx) > Math.abs(dy) ? 'horizontal' : 'vertical';
       }
     }
-    if (dragDirection === 'horizontal') {
-      return;
-    }
+    if (dragDirection === 'horizontal') return;
     if (dragDirection === 'vertical' && dy > 0) {
       isDragging = true;
       currentTranslate = dy;
@@ -166,25 +170,31 @@
 
   function onBackdropClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
-    if (target.classList.contains('backdrop')) close();
+    if (target.classList.contains('backdrop')) {
+      close();
+    }
   }
 </script>
 
 <style>
+  /* (mantive o teu CSS, levemente reorganizado) */
   .backdrop{ position:fixed; inset:0; background:rgba(0,0,0,0.7); display:flex; align-items:flex-end; justify-content:center; z-index:200; backdrop-filter: blur(3px); }
   .sheet{ width:100%; max-width:1000px; border-radius:18px 18px 0 0; background:linear-gradient(180deg,#0a0a0a,#000); color:#fff; padding:14px 12px 28px; box-shadow:0 -24px 50px rgba(0,0,0,0.7); touch-action: none; will-change: transform; }
   .handle{ width:48px; height:5px; background:rgba(255,255,255,0.18); border-radius:999px; margin:8px auto 14px; }
   .seasons{ display:flex; gap:10px; overflow-x:auto; padding:10px 8px 6px; scroll-snap-type:x proximity; -webkit-overflow-scrolling: touch; touch-action: pan-x; }
   .season{ flex:0 0 auto; padding:10px 16px; border-radius:14px; background:rgba(255,255,255,0.04); cursor:pointer; white-space:nowrap; scroll-snap-align:start; transition: background 0.2s ease, transform 0.1s ease; user-select: none; }
+  .season:active{ transform: scale(0.97); }
   .season.active{ background:linear-gradient(90deg,#1f2937,#111827); font-weight:700; }
   .episodes-row{ display:flex; gap:12px; overflow-x:auto; padding:14px 8px; scroll-snap-type:x mandatory; -webkit-overflow-scrolling: touch; touch-action: pan-x; }
   .card{ width:160px; border-radius:12px; background:rgba(255,255,255,0.04); overflow:hidden; cursor:pointer; flex:0 0 auto; scroll-snap-align:center; transition: transform 0.2s ease, background 0.2s ease; user-select: none; position:relative; }
   .card:hover{ background:rgba(255,255,255,0.08); }
+  .card:active{ transform: scale(0.96); }
   .thumb{ width:100%; height:95px; object-fit:cover; background:#0a0a0a; pointer-events: none; display:block; }
   .meta{ padding:10px; font-size:13px; pointer-events: none; }
   .close{ position:absolute; right:12px; top:10px; background:rgba(0,0,0,0.6); border:none; color:#fff; padding:9px; border-radius: 50%; cursor: pointer; transition: background 0.2s ease, transform 0.1s ease; z-index: 10; }
-  .close:hover{ background:rgba(0,0,0,0.8); }
+  .badge-watched { position:absolute; right:8px; top:8px; background:rgba(0,0,0,0.6); padding:6px; border-radius:999px; display:flex; align-items:center; justify-content:center; }
   .badge-current { position:absolute; left:8px; top:8px; background:rgba(34,197,94,0.12); padding:6px; border-radius:999px; display:flex; align-items:center; gap:6px; font-weight:700; font-size:12px; color:#e6fffa; padding-left:8px; padding-right:8px; }
+  .mark-small { position:absolute; left:8px; bottom:8px; background:rgba(0,0,0,0.5); padding:6px; border-radius:8px; font-size:12px; cursor:pointer; }
 </style>
 
 <div
@@ -208,12 +218,13 @@
     aria-label="Próximos episódios"
     tabindex="0"
   >
-    <div class="handle"></div>
+    <div class="handle" aria-hidden="true"></div>
 
     <button
       class="close"
       on:click|stopPropagation={close}
       aria-label="Fechar"
+      type="button"
     >
       <X class="h-5 w-5"/>
     </button>
@@ -241,8 +252,9 @@
       {#each seasons[selectedSeason]?.items || [] as ep}
         {@const idx = absoluteIndexFor(ep)}
         {@const epPath = ep.meta?.path}
+        {@const watched = manualWatched && epPath && manualWatched[epPath]}
         <div
-          class="card"
+          class="card {watched ? 'card-watched' : ''} {idx === currentItemIndex ? 'card-current' : ''}"
           role="button"
           tabindex="0"
           on:click|stopPropagation={() => selectEpisodeByIndex(idx)}
@@ -260,7 +272,11 @@
             loading="lazy"
             draggable="false"
           />
-
+          {#if watched}
+            <div class="badge-watched" title="Visto">
+              <Check class="h-4 w-4"/>
+            </div>
+          {/if}
           {#if nowPlaying && epPath === nowPlaying}
             <div class="badge-current">
               <Play class="h-3 w-3"/> Agora
@@ -279,6 +295,10 @@
               {ep.meta?.temporada || ''}
             </div>
           </div>
+
+          <button class="mark-small" type="button" on:click|stopPropagation={() => toggleManualWatched(epPath)}>
+            {watched ? 'Desmarcar' : 'Marcar visto'}
+          </button>
         </div>
       {/each}
     </div>

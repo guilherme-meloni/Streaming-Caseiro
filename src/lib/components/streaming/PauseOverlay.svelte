@@ -106,7 +106,7 @@
     <button
       type="button"
       class="play-button"
-      on:click|stopPropagation={onContinue}
+      on:click|preventDefault|stopPropagation={onContinue}
       aria-label="Continuar"
     >
       <Play class="h-12 w-12"/>
@@ -128,7 +128,7 @@
       <button
         type="button"
         class="btn-primary"
-        on:click|stopPropagation={onContinue}
+        on:click|preventDefault|stopPropagation={onContinue}
         aria-label="Continuar assistindo"
       >
         <Play class="h-5 w-5"/> Continuar
@@ -137,7 +137,7 @@
       <button
         type="button"
         class="btn-ghost"
-        on:click|stopPropagation={onNext}
+        on:click|preventDefault|stopPropagation={onNext}
         aria-label="Próximo episódio"
       >
         <SkipForward class="h-5 w-5"/> Próximo

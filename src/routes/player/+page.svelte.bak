@@ -1,542 +1,1065 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import { serverUrl } from '$lib/stores/settings';
-	import type { PlaylistItem, GradeUpdatePayload } from '$lib/types';
-	import { browser } from '$app/environment';
-	import { goto } from '$app/navigation';
-	import { fade, fly, scale } from 'svelte/transition';
-	import { page } from '$app/stores';
-	import { userHasInteracted } from '$lib/stores/playerState';
-	import { get } from 'svelte/store';
-	import { PlayCircle, SkipForward, RefreshCw, Tv, X, Maximize, Minimize } from 'lucide-svelte';
-	import { Filesystem, Directory } from '@capacitor/filesystem';
-	import { Capacitor } from '@capacitor/core';
+  import { onMount, onDestroy } from 'svelte';
+  import { browser } from '$app/environment';
+  import { page as pageStore } from '$app/stores';
+  import { goto } from '$app/navigation';
+  import { get } from 'svelte/store';
+  import { serverUrl } from '$lib/stores/settings';
+  import { userHasInteracted } from '$lib/stores/playerState';
+  import type { PlaylistItem, ShowDetails, AudioTrack } from '$lib/types';
+  import { getProgress, updateProgress, getMediaMetadata } from '$lib/api';
 
-	// --- ESTADO DO COMPONENTE ---
-	let videoPlayer: HTMLVideoElement;
-	let playerContainer: HTMLDivElement;
-	let isFullscreen = false;
-	let currentItem: PlaylistItem | null = null;
-	let socket: WebSocket;
-	let isLoading = true;
-	let connectionStatus = 'Aguardando configuração...';
-	let isVodMode = false;
+  import { createEventDispatcher } from 'svelte';
+  import { PlayCircle, ArrowLeft } from 'lucide-svelte';
 
-	// --- ESTADO DO CANAL 24H ---
-	let playlist: PlaylistItem[] = [];
-	let currentItemIndex = -1;
-	let itemStartTime = 0;
-	let reconnectAttempts = 0;
-	const maxReconnectAttempts = 12;
-	let currentChannel = 'main';
-	let availableChannels: GradeUpdatePayload['availableChannels'] = [];
-	let isChannelSelectorOpen = false;
-	let selectedItemForModal: PlaylistItem | null = null;
-	let heartbeatIntervalId: NodeJS.Timeout;
-	let upNextCheckInterval: NodeJS.Timeout;
-	let showUpNextPopup = false;
-	let upNextItem: PlaylistItem | null = null;
+  import PlayerControls from '$lib/components/streaming/PlayerControls.svelte';
+  import PauseOverlay from '$lib/components/streaming/PauseOverlay.svelte';
+  import NextEpisodesPanel from '$lib/components/streaming/NextEpisodesPanel.svelte';
 
-	// --- FUNÇÃO DE TELA CHEIA ---
-	function toggleFullscreen() {
-		if (!document.fullscreenElement) {
-			playerContainer?.requestFullscreen();
-		} else {
-			if (document.exitFullscreen) document.exitFullscreen();
-		}
-	}
+  const dispatch = createEventDispatcher();
 
-	function onFullscreenChange() {
-		isFullscreen = !!document.fullscreenElement;
-	}
+  // --- ESTADO DO PLAYER ---
+  let videoPlayer: HTMLVideoElement;
+  let backgroundVideoPlayer: HTMLVideoElement; // Usado para o efeito de fundo desfocado
+  let playerContainer: HTMLDivElement; // O contêiner principal do player, usado para fullscreen
+  let currentItem: PlaylistItem | null = null; // O item de mídia (VOD ou live) atualmente carregado
+  let playlist: PlaylistItem[] = []; // Lista de reprodução, principalmente para modo VOD
+  let currentItemIndex = -1; // Índice do item atual na `playlist`
+  let audioTracks: AudioTrack[] = []; // Lista de faixas de áudio disponíveis para o vídeo atual
+  let selectedAudioTrack: number | undefined = undefined; // Faixa de áudio selecionada
 
-	// --- LIFECYCLE ---
-	onMount(() => {
-		if (!browser) return;
+  // --- ESTADO DA UI ---
+  let isPlaying = false;
+  let currentTime = 0;
+  let duration = 0;
+  let volume = 0.7;
+  let isMuted = false;
+  let isFullscreen = false;
+  let playbackRate = 1;
+  let isFillScreen = false; // Controla o modo "preencher tela" (object-cover)
+  let isLoading = true;
+  let showControls = true; // Visibilidade dos controles do player
+  let showNextEpisodes = false; // Visibilidade do painel de próximos episódios
+  let controlsHideTimer: ReturnType<typeof setTimeout>; // Timer para esconder os controles automaticamente
 
-		document.addEventListener('fullscreenchange', onFullscreenChange);
+  // --- Overlay de Fim de Vídeo ---
+  let showEndOverlay = false; // Mostra a contagem regressiva para o próximo episódio
+  let endCountdown = 10;
+  let endCountdownTimer: ReturnType<typeof setInterval> | null = null;
 
-		const vodPathParam = $page.url.searchParams.get('play');
-		const offlinePathParam = $page.url.searchParams.get('playOffline');
-		const currentServerUrl = get(serverUrl);
+  // --- Mini-Player (Picture-in-Picture Fallback) ---
+  let inAppMini = false; // Ativa o modo mini-player dentro do app se o PiP nativo falhar
+  let miniPosition = { x: 12, y: 12 }; // Posição do mini-player
 
-		if (!currentServerUrl && !offlinePathParam) {
-			goto('/login');
-			return;
-		}
+  // --- Feedback Visual ---
+  let skipFlash: { dir: 'back' | 'forward'; visible: boolean } = { dir: 'forward', visible: false };
+  let skipFlashTimer: ReturnType<typeof setTimeout>; // Timer para o feedback de pular (e.g., +5s)
 
-		if (offlinePathParam) {
-			isVodMode = true;
-			isLoading = false;
-			connectionStatus = 'Modo Offline';
-			playOfflineVideo(offlinePathParam);
-		} else if (vodPathParam) {
-			isVodMode = true;
-			isLoading = false;
-			connectionStatus = 'Modo Vídeo On Demand';
-			videoPlayer.src = `${currentServerUrl}/midia/${vodPathParam}`;
-		} else {
-			isVodMode = false;
-			connectToEmissora(currentServerUrl);
-			setupUpNextCheck();
-		}
+  // --- Controles por Gestos ---
+  const SWIPE_THRESHOLD = 80; // (Não utilizado no momento, mas mantido para referência)
+  let lastTapLeft = 0; // Timestamp do último toque na área esquerda para detectar toque duplo
+  let lastTapRight = 0; // Timestamp do último toque na área direita
+  const DOUBLE_TAP_MS = 300; // Intervalo em ms para considerar um toque duplo
 
-		return () => {
-			if (socket) socket.close();
-			if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
-			if (upNextCheckInterval) clearInterval(upNextCheckInterval);
-			document.removeEventListener('fullscreenchange', onFullscreenChange);
-		};
-	});
+  // --- CONEXÃO (CANAL 24h) ---
+  let isVodMode = false; // `true` se estiver assistindo um VOD, `false` se for o canal 24h
+  let socket: WebSocket | null = null;
+  let connectionStatus = 'Aguardando configuração...';
+  let reconnectAttempts = 0; // Contador de tentativas de reconexão do WebSocket
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null; // Timer para manter a conexão WebSocket viva
 
-	// --- FUNÇÕES DE LÓGICA ---
-	async function playOfflineVideo(localPath: string) {
-		try {
-			const { uri } = await Filesystem.getUri({
-				path: localPath,
-				directory: Directory.Data
-			});
-			videoPlayer.src = Capacitor.convertFileSrc(uri);
-		} catch (e) {
-			console.error('Erro ao carregar vídeo offline', e);
-			connectionStatus = 'Erro ao carregar vídeo offline.';
-		}
-	}
+  // --- Progresso VOD ---
+  let saveTimer: ReturnType<typeof setTimeout> | null = null; // Timer para salvar o progresso do usuário
+  let currentMediaId: string | null = null; // ID da mídia atual para salvar o progresso
 
-	function connectToEmissora(url: string) {
-		const domain = url.replace(/^http?:\/\//, '');
-		const WS_URL = `ws://${domain}`;
-		isLoading = true;
-		connectionStatus = `Conectando à emissora...`;
-		socket = new WebSocket(WS_URL);
+  // Stores SvelteKit
+  $: page = $pageStore;
 
-		socket.onopen = () => {
-			reconnectAttempts = 0;
-			isLoading = false;
-			connectionStatus = 'Conectado';
-			heartbeatIntervalId = setInterval(() => {
-				if (socket && socket.readyState === WebSocket.OPEN) {
-					socket.send(JSON.stringify({ type: 'PING' }));
-				}
-			}, 20000);
-			const channelFromUrl = $page.url.searchParams.get('channel');
-			if (channelFromUrl) {
-				switchChannel(channelFromUrl);
-				const newUrl = new URL(window.location.href);
-				newUrl.searchParams.delete('channel');
-				history.replaceState({}, '', newUrl);
-			}
-		};
+  // Reativo: Atualiza o item atual sempre que o índice da playlist muda no modo VOD
+  $: if (isVodMode && currentItemIndex !== -1 && playlist[currentItemIndex]) {
+    currentItem = playlist[currentItemIndex];
+    currentMediaId = currentItem.meta?.path || null;
+  }
 
-		socket.onmessage = (event) => {
-			const message = JSON.parse(event.data);
-			if (message.type === 'GRADE_UPDATE') {
-				handleGradeUpdate(message.payload);
-			}
-			if (message.type === 'COMMAND' && videoPlayer) {
-				console.log('Comando de controle remoto recebido:', message.command);
-				switch (message.command) {
-					case 'PLAY_PAUSE':
-						videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause();
-						break;
-					case 'VOLUME_UP':
-						videoPlayer.volume = Math.min(1, videoPlayer.volume + 0.1);
-						break;
-					case 'VOLUME_DOWN':
-						videoPlayer.volume = Math.max(0, videoPlayer.volume - 0.1);
-						break;
-					case 'REWIND':
-						videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime - 10);
-						break;
-				}
-			}
-		};
+  /**
+   * Pausa a execução por um determinado número de milissegundos.
+   * @param ms - O tempo a esperar em milissegundos.
+   */
+  const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
 
-		socket.onclose = () => {
-			isLoading = true;
-			if (heartbeatIntervalId) clearInterval(heartbeatIntervalId);
-			if (reconnectAttempts < maxReconnectAttempts) {
-				reconnectAttempts++;
-				const delay = 5000;
-				connectionStatus = `Conexão perdida. Reconectando em ${delay / 1000}s...`;
-				setTimeout(() => connectToEmissora(url), delay);
-			} else {
-				connectionStatus = 'Falha ao reconectar.';
-			}
-		};
-		socket.onerror = () => (connectionStatus = 'Erro de conexão.');
-	}
+  /**
+   * Formata o nome de um arquivo de episódio para um formato mais legível.
+   * Ex: "serie_s01e03.mp4" -> "Episódio 3"
+   * @param filename - O nome do arquivo.
+   */
+  const formatEpisodeName = (filename: string): string => {
+    const match = filename?.match(/E(\d+)/i);
+    return match ? `Episódio ${parseInt(match[1], 10)}` : (filename?.replace?.('.mp4', '') ?? 'Episódio');
+  };
 
-	function handleGradeUpdate(payload: GradeUpdatePayload) {
-		const itemChanged =
-			payload.currentItemIndex !== currentItemIndex || currentChannel !== payload.channelMode;
-		playlist = payload.grade || [];
-		currentItemIndex = payload.currentItemIndex;
-		itemStartTime = payload.itemStartTime;
-		currentChannel = payload.channelMode || 'main';
-		availableChannels = payload.availableChannels || [];
-		if (get(userHasInteracted) && currentItemIndex >= 0) {
-			applyUpdateToPlayer(itemChanged);
-		}
-	}
+  /**
+   * Converte uma URL HTTP base para uma URL WebSocket (ws ou wss).
+   * @param baseHttpUrl - A URL HTTP do servidor (ex: "http://localhost:3000").
+   * @param wsPath - O caminho para o endpoint WebSocket (ex: "/ws").
+   */
+  function toWsUrl(baseHttpUrl: string, wsPath: string): string {
+    const base = new URL(baseHttpUrl);
+    const protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+    const cleanPath = wsPath.startsWith('/') ? wsPath : `/${wsPath}`;
+    return `${protocol}//${base.host}${cleanPath}`;
+  }
 
-	function applyUpdateToPlayer(itemChanged = false) {
-		if (isVodMode || !videoPlayer || currentItemIndex < 0 || !playlist[currentItemIndex]) return;
-		const newItem = playlist[currentItemIndex];
-		const srcChanged = currentItem?.src !== newItem.src;
-		currentItem = newItem;
-		if (srcChanged || itemChanged) videoPlayer.src = currentItem.src;
-		const serverElapsed = (Date.now() - itemStartTime) / 1000;
-		let targetTime = Math.max(0, serverElapsed - 2);
-		if (currentItem.start) targetTime += currentItem.start;
+  /**
+   * Resolve a URL final do WebSocket, usando variáveis de ambiente se disponíveis.
+   * @param baseHttpUrl - A URL HTTP do servidor.
+   */
+  function resolveWsUrl(baseHttpUrl: string): string {
+    const abs = (import.meta as any).env?.VITE_WS_ABSOLUTE as string | undefined;
+    if (abs) return abs;
+    const path = ((import.meta as any).env?.VITE_WS_PATH as string) || '/ws/emissora';
+    return toWsUrl(baseHttpUrl, path);
+  }
 
-		const seek = () => {
-			if (videoPlayer && Math.abs(videoPlayer.currentTime - targetTime) > 2.5) {
-				videoPlayer.currentTime = targetTime;
-			}
-			videoPlayer?.play().catch(() => {});
-		};
-		if (videoPlayer && videoPlayer.readyState >= 2) seek();
-		else if (videoPlayer) videoPlayer.onloadeddata = seek;
-	}
+  // --- CICLO DE VIDA DO COMPONENTE ---
 
-	function handleFirstInteraction() {
-		if (get(userHasInteracted)) return;
-		userHasInteracted.set(true);
-		if (videoPlayer) {
-			videoPlayer.muted = false;
-			videoPlayer.play().catch(() => {});
-		}
-	}
+  onMount(async () => {
+    if (!browser) return; // Executar apenas no navegador
 
-	function sendCommand(command: string, data = {}) {
-		if (socket && socket.readyState === WebSocket.OPEN) {
-			socket.send(JSON.stringify({ type: 'COMMAND', command, ...data }));
-		}
-	}
+    // Listener para o estado de tela cheia
+    const fsHandler = () => (isFullscreen = !!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', fsHandler);
 
-	function switchChannel(channelCode: string) {
-		sendCommand('SWITCH_CHANNEL', { channel: channelCode });
-		isChannelSelectorOpen = false;
-	}
+    // Determina o modo (VOD ou Canal 24h) com base nos parâmetros da URL
+    const vodPathParam = page.url.searchParams.get('play');
+    const showCode = page.url.searchParams.get('showCode');
+    const currentServer = get(serverUrl);
 
-	function setupUpNextCheck() {
-		if (upNextCheckInterval) clearInterval(upNextCheckInterval);
-		upNextCheckInterval = setInterval(() => {
-			const currentLiveItem = playlist[currentItemIndex];
-			if (isVodMode || !currentLiveItem || !itemStartTime || currentLiveItem.tipo !== 'desenho') {
-				if (showUpNextPopup) showUpNextPopup = false;
-				return;
-			}
-			const elapsedSeconds = (Date.now() - itemStartTime) / 1000;
-			const totalDuration = currentLiveItem.duration;
-			const timeLeft = totalDuration - elapsedSeconds;
+    if (!currentServer && !vodPathParam) {
+      goto('/login'); // Redireciona se não houver servidor configurado
+      return;
+    }
 
-			if (timeLeft <= 60 && timeLeft > 5) {
-				if (!showUpNextPopup) {
-					const nextCartoon = playlist.slice(currentItemIndex + 1).find((item) => item.tipo === 'desenho');
-					if (nextCartoon) {
-						upNextItem = nextCartoon;
-						showUpNextPopup = true;
-					}
-				}
-			} else {
-				if (showUpNextPopup) showUpNextPopup = false;
-			}
-		}, 1000);
-	}
+    userHasInteracted.set(true);
 
-	const formatDuration = (seconds: number) => {
-		if (!seconds || seconds < 60) return `${Math.round(seconds || 0)}s`;
-		return `${Math.round(seconds / 60)}min`;
-	};
+    // Tenta travar a orientação em paisagem em dispositivos móveis
+    try { await lockLandscape(); } catch(e) {}
 
-	$: proximosDesenhos = playlist
-		.slice(currentItemIndex + 1)
-		.filter((item) => item && item.tipo === 'desenho')
-		.slice(0, 5);
+    // Tenta entrar em tela cheia automaticamente após um breve atraso
+    setTimeout(() => {
+      if (playerContainer && playerContainer.requestFullscreen) {
+        playerContainer.requestFullscreen().catch(e => console.warn("Falha ao entrar em tela cheia automaticamente:", e));
+      }
+    }, 500);
+
+    // --- Lógica de Inicialização ---
+    if (vodPathParam) {
+      // MODO VOD (Video on Demand)
+      isVodMode = true;
+      isLoading = true;
+      try {
+        await loadVodPlaylist(currentServer!, vodPathParam, showCode);
+        playCurrentVodItem();
+        isLoading = false;
+      } catch (e) {
+        console.error('[VOD] Falha ao montar playlist:', e);
+        // Fallback: se a API falhar, tenta tocar o vídeo diretamente
+        const finalVodPath = `${currentServer}/midia/${vodPathParam}`;
+        playlist = [{
+          src: finalVodPath,
+          nome: 'Episódio',
+          tipo: 'desenho',
+          duration: 0,
+          meta: { path: vodPathParam }
+        }];
+        currentItemIndex = 0;
+        currentItem = playlist[currentItemIndex];
+        currentMediaId = vodPathParam;
+        playCurrentVodItem();
+        isLoading = false;
+      }
+    } else {
+      // MODO CANAL 24h (Live)
+      isVodMode = false;
+      connectToEmissora(currentServer!);
+      isLoading = false;
+    }
+
+    // Salva o progresso antes de o usuário sair da página
+    const beforeUnload = () => {
+      trySaveProgressNow();
+      unlockOrientation();
+    };
+    window.addEventListener('beforeunload', beforeUnload);
+
+    // Limpeza ao destruir o componente
+    onDestroy(() => {
+      if (socket) socket.close();
+      if (heartbeatTimer) clearTimeout(heartbeatTimer);
+      if (saveTimer) clearTimeout(saveTimer);
+      if (endCountdownTimer) clearInterval(endCountdownTimer);
+      document.removeEventListener('fullscreenchange', fsHandler);
+      window.removeEventListener('beforeunload', beforeUnload);
+      unlockOrientation();
+    });
+  });
+
+  // --- LÓGICA DE VOD ---
+
+  /**
+   * Carrega a playlist para um show específico (se `showCode` for fornecido)
+   * ou cria uma playlist de item único para um vídeo direto.
+   * @param baseUrl - A URL base do servidor.
+   * @param currentPath - O caminho do arquivo de mídia a ser reproduzido.
+   * @param showCode - O código do show/série para buscar a playlist completa.
+   */
+  async function loadVodPlaylist(baseUrl: string, currentPath: string, showCode: string | null) {
+    // Se não há showCode, é um vídeo avulso.
+    if (!showCode || showCode === 'undefined') {
+      const finalVodPath = `${baseUrl}/midia/${currentPath}`;
+      playlist = [{
+        src: finalVodPath,
+        nome: formatEpisodeName(currentPath),
+        tipo: 'desenho',
+        duration: 0,
+        meta: { path: currentPath, poster: null, showName: null, descricao: null }
+      }];
+      currentItemIndex = 0;
+      return;
+    }
+
+    const resp = await fetch(`${baseUrl}/api/catalogo/${showCode}`);
+    if (!resp.ok) throw new Error(`Falha ao buscar detalhes para o show ${showCode}`);
+
+    const data = await resp.json();
+    if (!data.ok || !data.desenho) throw new Error(data.error || 'Resposta da API inválida.');
+
+    const details: ShowDetails = data.desenho;
+    const isMovie = !details.temporadas || details.temporadas.length === 0;
+
+    if (isMovie) {
+      // Monta a playlist para um filme (item único).
+      const metaPath = details.path || (details.temporadas && details.temporadas[0]?.episodios?.[0]?.path) || currentPath;
+      playlist = [{
+        src: `${baseUrl}/midia/${metaPath}`,
+        nome: details.nomeReal || 'Filme',
+        tipo: 'desenho',
+        duration: 0,
+        meta: {
+          path: metaPath,
+          poster: details.poster || details.posterUrl || null,
+          showName: details.nomeReal || details.name || null,
+          descricao: details.descricao || details.overview || null
+        }
+      }];
+    } else {
+      // Monta a playlist para série — achata temporadas e episódios
+      const episodesFlat = details.temporadas.flatMap(t => (t.episodios || []).map(ep => ({
+        ...ep,
+        temporada: t.nome || t.name || `Temporada ${t.seasonNumber || ''}`
+      })));
+
+      playlist = episodesFlat.map(ep => ({
+        src: `${baseUrl}/midia/${ep.path || ep.arquivo || ep.file}`,
+        nome: ep.titulo || ep.title || formatEpisodeName(ep.arquivo || ep.file || ep.path),
+        tipo: 'desenho',
+        duration: 0,
+        meta: {
+          path: ep.path || ep.arquivo || ep.file,
+          tituloEpisodio: ep.titulo || ep.title || null,
+          temporada: ep.temporada || null,
+          poster: ep.thumbnail || details.poster || details.posterUrl || null,
+          showName: details.nomeReal || details.name || null,
+          descricao: ep.sinopse || ep.synopsis || ep.overview || details.descricao || details.overview || null
+        }
+      }));
+    }
+
+    // Encontra o índice do episódio atual:
+    // 1) tentativa exata
+    let idx = playlist.findIndex(p => p.meta?.path === currentPath);
+
+    // 2) fallback: comparar apenas basename (quando o backend/root path varia)
+    if (idx === -1) {
+      const targetBase = (currentPath || '').split('/').pop();
+      idx = playlist.findIndex(p => {
+        const mp = p.meta?.path || '';
+        return mp === currentPath || (mp && mp.split('/').pop() === targetBase);
+      });
+    }
+
+    currentItemIndex = idx >= 0 ? idx : 0;
+
+    if (!playlist[currentItemIndex]) {
+      throw new Error("Não foi possível encontrar o item atual na playlist montada.");
+    }
+  }
+
+  /**
+   * Agenda o salvamento do progresso do vídeo após um curto período de inatividade no player.
+   * Isso evita chamadas excessivas à API durante a busca (seeking).
+   */
+  function scheduleSaveProgress() {
+    if (!isVodMode || !currentMediaId) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      try {
+        await updateProgress(currentMediaId!, Math.floor(videoPlayer?.currentTime || 0), Math.floor(videoPlayer?.duration || duration || 0));
+      } catch (e) {
+        console.warn('[VOD] Falha ao salvar progresso:', e);
+      }
+    }, 5000); // Salva a cada 5 segundos de reprodução
+  }
+
+  /**
+   * Força o salvamento imediato do progresso. Útil ao pausar ou fechar o player.
+   */
+  async function trySaveProgressNow() {
+    if (!isVodMode || !currentMediaId) return;
+    try {
+      await updateProgress(currentMediaId!, Math.floor(videoPlayer?.currentTime || 0), Math.floor(videoPlayer?.duration || duration || 0));
+    } catch {}
+  }
+
+  // --- HANDLERS DE EVENTOS DO PLAYER ---
+
+  /** Mostra os controles e reinicia o timer para escondê-los. */
+  function showControlsAndResetTimer() {
+    showControls = true;
+    clearTimeout(controlsHideTimer);
+    controlsHideTimer = setTimeout(() => (showControls = false), 3000);
+  }
+
+  /** Chamado quando o vídeo começa a tocar. */
+  const onPlay = async () => {
+    isPlaying = true;
+    showControlsAndResetTimer();
+    showEndOverlay = false;
+    if (endCountdownTimer) { clearInterval(endCountdownTimer); endCountdownTimer = null; }
+    if (backgroundVideoPlayer) {
+      try { backgroundVideoPlayer.play(); } catch(e){}
+    }
+  };
+
+  /** Chamado quando o vídeo é pausado. */
+  const onPause = () => {
+    isPlaying = false;
+    trySaveProgressNow();
+    showControls = true;
+    clearTimeout(controlsHideTimer);
+    if (backgroundVideoPlayer) {
+      try { backgroundVideoPlayer.pause(); } catch(e){}
+    }
+  };
+
+  /** Chamado continuamente enquanto o vídeo está tocando. */
+  const onTimeUpdate = () => {
+    currentTime = videoPlayer.currentTime;
+    duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : duration;
+    scheduleSaveProgress();
+    if (backgroundVideoPlayer) {
+      try { backgroundVideoPlayer.currentTime = videoPlayer.currentTime; } catch(e){}
+    }
+  };
+
+  const onVolumeChange = () => {
+    volume = videoPlayer.volume;
+    isMuted = videoPlayer.muted;
+  };
+
+  /** Chamado quando os metadados do vídeo (duração, etc.) são carregados. */
+  const onLoadedMetadata = async () => {
+    duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : duration;
+    videoPlayer.volume = volume;
+    videoPlayer.muted = isMuted;
+
+    // Sincroniza o vídeo de fundo
+    if (backgroundVideoPlayer) {
+      try {
+        backgroundVideoPlayer.src = videoPlayer.src;
+        backgroundVideoPlayer.playbackRate = videoPlayer.playbackRate;
+        backgroundVideoPlayer.load();
+        await backgroundVideoPlayer.play().catch(()=>{});
+      } catch(e){}
+    }
+
+    // Em modo VOD, busca e aplica o progresso salvo anteriormente.
+    if (isVodMode && currentMediaId) {
+      try {
+        const savedPosition = await getProgress(currentMediaId);
+        if (savedPosition > 5 && savedPosition < duration) {
+          videoPlayer.currentTime = savedPosition;
+        }
+      } catch (e) {
+        console.warn('[VOD] getProgress falhou:', e);
+      }
+    }
+
+    // Integração com a Media Session API para controles de mídia nativos (tela de bloqueio, etc.)
+    if ('mediaSession' in navigator) {
+      try {
+        (navigator as any).mediaSession.metadata = new MediaMetadata({
+          title: currentItem?.nome || 'Canal Local',
+          artist: currentItem?.meta?.temporada || '',
+          album: currentItem?.meta?.showName || '',
+          artwork: [{ src: currentItem?.meta?.poster || '', sizes: '512x512', type: 'image/jpeg' }]
+        });
+        (navigator as any).mediaSession.setActionHandler('play', playPause);
+        (navigator as any).mediaSession.setActionHandler('pause', playPause);
+        (navigator as any).mediaSession.setActionHandler('seekbackward', () => nudge(-10));
+        (navigator as any).mediaSession.setActionHandler('seekforward', () => nudge(10));
+        if (playlist.length > 1) {
+          (navigator as any).mediaSession.setActionHandler('previoustrack', () => performNextEpisode(currentItemIndex - 1));
+          (navigator as any).mediaSession.setActionHandler('nexttrack', () => performNextEpisode(currentItemIndex + 1));
+        }
+      } catch(e){}
+    }
+  };
+
+  // --- FUNÇÕES DE CONTROLE DO PLAYER ---
+
+  const playPause = () => {
+    if (!videoPlayer) return;
+    videoPlayer.paused ? videoPlayer.play().catch(e => console.error("Erro ao tocar vídeo:", e)) : videoPlayer.pause();
+  };
+  const seek = (time: number) => {
+    const d = Number.isFinite(duration) ? duration : (Number.isFinite(videoPlayer?.duration) ? videoPlayer.duration : 0);
+    videoPlayer.currentTime = Math.max(0, Math.min(d || Infinity, time));
+  };
+  const nudge = (delta: number) => {
+    seek((videoPlayer?.currentTime || 0) + delta);
+    showSkipFlash(delta);
+  };
+  const setVolume = (vol: number) => (videoPlayer.volume = vol);
+  const toggleMute = () => (videoPlayer.muted = !videoPlayer.muted);
+  const setPlaybackRate = (rate: number) => {
+    if (!videoPlayer) return;
+    videoPlayer.playbackRate = rate;
+    playbackRate = rate;
+    if (backgroundVideoPlayer) {
+      try { backgroundVideoPlayer.playbackRate = rate; } catch(e){}
+    }
+  };
+  const toggleFullscreen = async () => {
+    if (!document.fullscreenElement) {
+      try { await lockLandscape(); } catch(e){}
+      try {
+        if (playerContainer?.requestFullscreen) await playerContainer.requestFullscreen();
+      } catch(e){ console.warn('toggleFullscreen falhou', e); }
+    } else {
+      try { await unlockOrientation(); } catch(e){}
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+      } catch(e){}
+    }
+  };
+  const goBack = () => history.back();
+
+  /**
+   * Altera a faixa de áudio do vídeo em reprodução.
+   * Recarrega o vídeo com o novo parâmetro de áudio.
+   * @param trackIndex - O índice da faixa de áudio a ser selecionada.
+   */
+  async function changeAudioTrack(trackIndex: number) {
+    if (!videoPlayer || !currentItem?.meta?.path) return;
+
+    const wasPlaying = isPlaying;
+    const savedTime = videoPlayer.currentTime;
+    videoPlayer.pause();
+
+    selectedAudioTrack = trackIndex;
+    const originalSrc = currentItem.src.split('?')[0];
+    const newSrc = `${originalSrc}?audioIndex=${trackIndex}`;
+
+    videoPlayer.src = newSrc;
+    try { videoPlayer.load(); } catch(e){}
+    videoPlayer.currentTime = savedTime;
+    if (wasPlaying) {
+      videoPlayer.play().catch((e) => console.error('Erro ao retomar após troca de áudio:', e));
+    }
+  }
+
+  /**
+   * Inicia a reprodução do item atual na playlist VOD.
+   * Também busca metadados de áudio para o novo item.
+   */
+  function playCurrentVodItem() {
+    if (isVodMode && currentItemIndex !== -1 && currentItem) {
+      selectedAudioTrack = undefined;
+      audioTracks = [];
+
+      if (currentMediaId) {
+        getMediaMetadata(currentMediaId)
+          .then(metadata => {
+            if (metadata.audioTracks && metadata.audioTracks.length > 1) audioTracks = metadata.audioTracks;
+          })
+          .catch(e => console.warn('[Player] Falha ao buscar metadados de áudio:', e));
+      }
+
+      videoPlayer.src = currentItem.src;
+      if (backgroundVideoPlayer) backgroundVideoPlayer.src = currentItem.src;
+      videoPlayer.play().catch(async () => {
+        await sleep(300);
+        videoPlayer.play().catch(e => console.error('Erro ao iniciar VOD:', e));
+      });
+    }
+  }
+
+  // --- LÓGICA DE WEBSOCKET (CANAL 24h) ---
+
+  /** Envia um 'ping' a cada 15 segundos para manter a conexão WebSocket ativa. */
+  function startHeartbeat() {
+    stopHeartbeat();
+    const tick = () => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
+      }
+      heartbeatTimer = setTimeout(tick, 15000);
+    };
+    heartbeatTimer = setTimeout(tick, 15000);
+  }
+  function stopHeartbeat() {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer);
+  }
+
+  /** Agenda uma tentativa de reconexão com delay exponencial. */
+  function scheduleReconnect(baseUrl: string) {
+    reconnectAttempts++;
+    const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempts)); // Aumenta o delay a cada tentativa
+    setTimeout(() => connectToEmissora(baseUrl), delay);
+  }
+
+  /** Inicia a conexão com o servidor WebSocket da emissora. */
+  function connectToEmissora(baseUrl: string) {
+    const wsUrl = resolveWsUrl(baseUrl);
+    connectionStatus = 'Conectando à emissora...';
+
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (e) {
+      connectionStatus = 'Falha ao criar conexão WebSocket.';
+      scheduleReconnect(baseUrl);
+      return;
+    }
+
+    socket.onopen = () => {
+      connectionStatus = 'Conectado à emissora.';
+      reconnectAttempts = 0;
+      startHeartbeat();
+      // Envia comandos iniciais para se registrar no canal principal
+      socket?.send(JSON.stringify({ type: 'hello', client: 'pwa', ts: Date.now() }));
+      socket?.send(JSON.stringify({ type: 'COMMAND', command: 'SWITCH_CHANNEL', channel: 'main' }));
+    };
+
+    socket.onmessage = (ev) => {
+      let data: any = null;
+      try { data = JSON.parse(ev.data); } catch {}
+      if (data) handleWsMessage(data);
+    };
+
+    socket.onerror = () => connectionStatus = 'Erro na conexão com a emissora.';
+    socket.onclose = () => {
+      connectionStatus = 'Desconectado. Tentando reconectar...';
+      stopHeartbeat();
+      scheduleReconnect(baseUrl);
+    };
+  }
+
+  /** Processa mensagens recebidas do WebSocket. */
+  function handleWsMessage(msg: any) {
+    switch (msg?.type) {
+      case 'stream': // Nova URL de stream
+        if (typeof msg.url === 'string' && msg.url && videoPlayer.src !== msg.url) {
+          videoPlayer.src = msg.url;
+          if (backgroundVideoPlayer) backgroundVideoPlayer.src = msg.url;
+          videoPlayer.play().catch(e => console.error('Erro ao iniciar stream:', e));
+          isLoading = false;
+        }
+        break;
+      case 'playlist': // (Não utilizado no momento)
+        if (Array.isArray(msg.items)) playlist = msg.items;
+        break;
+      case 'nowPlaying': // Metadados do item atual
+        if (msg.meta) {
+          currentItem = { src: videoPlayer.src, nome: msg.meta.titulo || 'Ao vivo', tipo: 'canal', duration: 0, meta: msg.meta };
+        }
+        break;
+      case 'ping': // Servidor testando a conexão
+        socket?.send(JSON.stringify({ type: 'pong', ts: Date.now() }));
+        break;
+    }
+  }
+
+  // --- LÓGICA DE GESTOS E ENTRADAS ---
+
+  $: proximosDesenhos = isVodMode ? playlist.slice(currentItemIndex + 1, currentItemIndex + 13) : [];
+  $: hasNextEpisode = isVodMode && currentItemIndex < playlist.length - 1;
+
+  /** Mostra um feedback visual (+5s / -5s) na tela. */
+  function showSkipFlash(delta: number) {
+    clearTimeout(skipFlashTimer);
+    skipFlash.dir = delta >= 0 ? 'forward' : 'back';
+    skipFlash.visible = true;
+    skipFlashTimer = setTimeout(() => (skipFlash.visible = false), 350);
+  }
+
+  // Funções de clique duplo (agora substituídas pelo injector de double-tap)
+  function handleLeftDblClick() { nudge(-5); }
+  function handleRightDblClick() { nudge(+5); }
+  function onTouchEndLeft() {
+    const now = Date.now();
+    if (now - lastTapLeft < DOUBLE_TAP_MS) { nudge(-5); lastTapLeft = 0; }
+    else { lastTapLeft = now; }
+  }
+  function onTouchEndRight() {
+    const now = Date.now();
+    if (now - lastTapRight < DOUBLE_TAP_MS) { nudge(+5); lastTapRight = 0; }
+    else { lastTapRight = now; }
+  }
+
+  /**
+   * Este bloco `onMount` é um "injetor" de lógica para o double-tap.
+   * Ele adiciona listeners de `touchend` e `dblclick` diretamente ao contêiner do player
+   * para controlar o avanço/retrocesso e play/pause com toques duplos.
+   */
+  import { onMount as __doubleTap_onMount } from 'svelte';
+  __doubleTap_onMount(() => {
+    try {
+      let lastTapTime = 0;
+      let lastTapX = 0;
+      const EDGE_ZONE_RATIO = 0.25; // 25% da tela nas laterais para avanço/retrocesso
+
+      function handleTapEvent(clientX, clientY) {
+        const now = Date.now();
+        const isDouble = (now - lastTapTime) <= DOUBLE_TAP_MS && Math.abs(clientX - lastTapX) < 140;
+        lastTapTime = now;
+        lastTapX = clientX;
+
+        const rect = playerContainer?.getBoundingClientRect?.();
+        const width = rect?.width || window.innerWidth;
+        const leftZone = width * EDGE_ZONE_RATIO;
+        const rightZone = width * (1 - EDGE_ZONE_RATIO);
+
+        if (isDouble) {
+          if (clientX <= leftZone) { // Toque duplo na esquerda
+            nudge(-5);
+          } else if (clientX >= rightZone) { // Toque duplo na direita
+            nudge(5);
+          } else { // Toque duplo no centro
+            playPause();
+          }
+        } else {
+          // Toque simples: alterna a visibilidade dos controles
+          showControls = !showControls;
+        }
+      }
+
+      function attachHandlers() {
+        if (!playerContainer) return;
+        // Listener para toques em dispositivos móveis
+        playerContainer.addEventListener('touchend', (ev) => {
+          if (!ev.changedTouches || ev.changedTouches.length === 0) return;
+          handleTapEvent(ev.changedTouches[0].clientX, ev.changedTouches[0].clientY);
+        }, { passive: true });
+
+        // Listener para cliques duplos no desktop
+        playerContainer.addEventListener('dblclick', (ev) => {
+          handleTapEvent(ev.clientX, ev.clientY);
+        });
+      }
+
+      setTimeout(attachHandlers, 800); // Atraso para garantir que o contêiner esteja pronto
+    } catch(e) {
+      console.warn('Falha ao injetar lógica de double-tap:', e);
+    }
+  });
+
+  /** Chamado quando o vídeo atual termina. */
+  function onEnded() {
+    if (!hasNextEpisode) {
+      showEndOverlay = true;
+      endCountdown = 0;
+      isPlaying = false;
+      return;
+    }
+    // Inicia a contagem regressiva para o próximo episódio
+    showEndOverlay = true;
+    endCountdown = 10;
+    isPlaying = false;
+    if (endCountdownTimer) clearInterval(endCountdownTimer);
+    endCountdownTimer = setInterval(() => {
+      endCountdown -= 1;
+      if (endCountdown <= 0) {
+        if (endCountdownTimer) clearInterval(endCountdownTimer);
+        performNextEpisode();
+      }
+    }, 1000);
+  }
+
+  function cancelEndCountdown() {
+    if (endCountdownTimer) clearInterval(endCountdownTimer);
+    showEndOverlay = false;
+    endCountdown = 0;
+  }
+
+  /**
+   * Carrega e reproduz o próximo episódio na playlist.
+   * @param targetIndex - O índice do episódio a ser tocado. Se não for fornecido, toca o próximo.
+   */
+  function performNextEpisode(targetIndex?: number) {
+    try { videoPlayer.pause(); } catch(e){}
+    const nextIndex = targetIndex !== undefined ? targetIndex : currentItemIndex + 1;
+
+    if (nextIndex >= 0 && nextIndex < playlist.length) {
+      currentItemIndex = nextIndex;
+      playCurrentVodItem();
+    }
+    showEndOverlay = false;
+    if (endCountdownTimer) clearInterval(endCountdownTimer);
+  }
+
+  // --- CONTROLE DE TELA E ORIENTAÇÃO ---
+
+  /** Tenta travar a orientação da tela em paisagem (landscape). */
+  async function lockLandscape() {
+    try {
+      if (screen?.orientation?.lock) {
+        await screen.orientation.lock('landscape');
+      } else {
+        const cap = (window as any).Capacitor;
+        if (cap?.Plugins?.ScreenOrientation?.lock) {
+          await cap.Plugins.ScreenOrientation.lock({ orientation: 'landscape' });
+        }
+      }
+    } catch(e){}
+  }
+
+  /** Destrava a orientação da tela. */
+  async function unlockOrientation() {
+    try {
+      if (screen?.orientation?.unlock) {
+        screen.orientation.unlock();
+      } else {
+        const cap = (window as any).Capacitor;
+        if (cap?.Plugins?.ScreenOrientation?.unlock) {
+          await cap.Plugins.ScreenOrientation.unlock();
+        }
+      }
+    } catch(e){}
+  }
+
+  // --- MODO MINI-PLAYER (PICTURE-IN-PICTURE) ---
+
+  /** Tenta entrar em modo Picture-in-Picture nativo, ou usa o fallback de mini-player no app. */
+  async function enterMiniMode() {
+    try {
+      if (videoPlayer && (videoPlayer as any).requestPictureInPicture) {
+        await (videoPlayer as any).requestPictureInPicture();
+        return;
+      }
+    } catch(e) {
+      console.warn('PiP nativo falhou, usando fallback:', e);
+    }
+    inAppMini = true;
+    videoPlayer?.classList?.add('mini-video');
+    attachMiniDragHandlers();
+    showControls = true;
+  }
+
+  function exitMiniMode() {
+    try {
+      if (document?.exitPictureInPicture) {
+        document.exitPictureInPicture().catch(()=>{});
+      }
+    } catch(e) {}
+    inAppMini = false;
+    videoPlayer?.classList?.remove('mini-video');
+    detachMiniDragHandlers();
+  }
+
+  // --- Lógica de Arrastar o Mini-Player ---
+  let dragging = false;
+  let startX = 0, startY = 0, baseX = 12, baseY = 12;
+
+  function attachMiniDragHandlers() { /* ... */ }
+  function detachMiniDragHandlers() { /* ... */ }
+  function miniDragStart(ev: any) { /* ... */ }
+  function miniDragMove(ev: any) { /* ... */ }
+  function miniDragEnd() { /* ... */ }
+
+  /** Handler global para atalhos de teclado. */
+  function onKeydownGlobal(e: KeyboardEvent) {
+    if (!videoPlayer) return;
+    if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); playPause(); }
+    if (e.key === 'ArrowRight') nudge(5);
+    if (e.key === 'ArrowLeft') nudge(-5);
+    if (e.key === 'f') toggleFullscreen();
+  }
+  window.addEventListener('keydown', onKeydownGlobal);
+  onDestroy(() => {
+    window.removeEventListener('keydown', onKeydownGlobal);
+    try { if ('mediaSession' in navigator) (navigator as any).mediaSession.metadata = null; } catch(e){}
+  });
+
+  // --- Handlers para eventos dos componentes filhos ---
+
+  function handlePauseOverlayNext(e: Event) {
+    e?.stopPropagation?.();
+    // executar em next tick evita problemas em que o primeiro clique só muda UI
+    setTimeout(() => {
+      performNextEpisode();
+    }, 0);
+  }
+
+  function handlePauseOverlaySelect(e: CustomEvent<number>) {
+    if (e?.detail === undefined) return;
+    e?.stopPropagation?.();
+    const idx = Number(e.detail);
+    if (!Number.isFinite(idx)) return;
+    setTimeout(() => performNextEpisode(idx), 0);
+  }
+
+  function handleOpenEpisodesFromOverlay(e: Event) {
+    e?.stopPropagation?.();
+    showNextEpisodes = true;
+  }
+
 </script>
 
+<!--
+  Contêiner principal do player.
+  - `role="application"`: Define a região como uma aplicação para acessibilidade.
+  - `touch-manipulation`: Otimiza a resposta a gestos de toque em navegadores móveis.
+  - `on:mousemove` e `on:keydown`: Mostra os controles quando há atividade do usuário.
+-->
+<div
+  bind:this={playerContainer}
+  role="application"
+  class="relative flex h-screen w-screen select-none flex-col items-center justify-center overflow-hidden bg-black text-white touch-manipulation"
+  on:mousemove={showControlsAndResetTimer}
+  on:keydown={showControlsAndResetTimer}
+>
+
+  <!-- Overlay inicial que exige interação do usuário para iniciar a reprodução com som -->
+  {#if !$userHasInteracted && !isVodMode}
+    <div
+      class="absolute inset-0 z-50 flex cursor-pointer flex-col items-center justify-center gap-4 p-4 text-center"
+      on:click={() => userHasInteracted.set(true)}
+      on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && userHasInteracted.set(true)}
+      role="button"
+      tabindex="0"
+    >
+      <PlayCircle class="h-24 w-24 text-white drop-shadow-2xl" />
+      <h1 class="text-4xl font-bold drop-shadow-lg">Tocar para Iniciar</h1>
+    </div>
+  {/if}
+
+  <!-- Vídeo de fundo com efeito de desfoque para uma aparência cinematográfica -->
+  <video
+    bind:this={backgroundVideoPlayer}
+    class="cinematic-background"
+    autoplay
+    playsinline
+    muted
+    loop
+    on:ended={() => backgroundVideoPlayer.play()}
+    on:error={(e) => console.error('Background video error:', e)}
+  ></video>
+
+  <!-- Elemento de vídeo principal -->
+  <video
+    bind:this={videoPlayer}
+    on:play={onPlay}
+    on:pause={onPause}
+    on:timeupdate={onTimeUpdate}
+    on:volumechange={onVolumeChange}
+    on:loadedmetadata={onLoadedMetadata}
+    on:ended={onEnded}
+    class="{inAppMini ? 'mini-video' : ''} h-full w-full {isFillScreen ? 'object-cover' : 'object-contain'} {(!$userHasInteracted && !isVodMode) ? 'blur-sm' : ''} relative z-0"
+    autoplay
+    playsinline
+    muted={!$userHasInteracted && !isVodMode}
+  ></video>
+
+  <!-- Camada de Controles e Gestos (só ativa após interação do usuário) -->
+  {#if $userHasInteracted || isVodMode}
+    <!--
+      Divisórias invisíveis para captura de gestos de toque duplo.
+      Cobrem a metade esquerda e direita da tela para retroceder ou avançar o vídeo.
+    -->
+    <div class="pointer-events-auto absolute inset-0 z-10">
+      <div
+        class="absolute inset-y-0 left-0 w-1/2"
+        role="button"
+        aria-label="Voltar 5 segundos"
+        on:dblclick|stopPropagation={handleLeftDblClick}
+        on:touchend|stopPropagation={onTouchEndLeft}
+        tabindex="0"
+      ></div>
+      <div
+        class="absolute inset-y-0 right-0 w-1/2"
+        role="button"
+        aria-label="Avançar 5 segundos"
+        on:dblclick|stopPropagation={handleRightDblClick}
+        on:touchend|stopPropagation={onTouchEndRight}
+        tabindex="0"
+      ></div>
+    </div>
+
+    <!-- Feedback visual para avanço/retrocesso (+5s / -5s) -->
+    {#if skipFlash.visible}
+      <div class="pointer-events-none absolute inset-0 z-20">
+        {#if skipFlash.dir === 'back'}
+          <div class="absolute left-6 top-1/2 -translate-y-1/2 rounded-xl bg-black/60 px-4 py-3 text-2xl font-bold backdrop-blur-md animate-pulse">-5s</div>
+        {:else}
+          <div class="absolute right-6 top-1/2 -translate-y-1/2 rounded-xl bg-black/60 px-4 py-3 text-2xl font-bold backdrop-blur-md animate-pulse">+5s</div>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Controles principais (botão de voltar, barra de progresso, etc.) -->
+    <div class="absolute inset-0 z-30 pointer-events-none">
+      <button
+        on:click={goBack}
+        class="absolute left-4 top-4 z-20 flex h-12 w-12 items-center justify-center rounded-full bg-black/50 transition-colors hover:bg-black/75 pointer-events-auto {showControls ? 'opacity-100' : 'opacity-0'}"
+      >
+        <ArrowLeft class="h-6 w-6" />
+      </button>
+
+      <!-- Controles inferiores (play, volume, etc.) -->
+      <div class="absolute bottom-0 inset-x-0 pointer-events-auto {showControls ? 'opacity-100' : 'opacity-0'} transition-opacity duration-300">
+        <PlayerControls
+          {isPlaying}
+          {currentTime}
+          {duration}
+          {volume}
+          {isMuted}
+          {isFullscreen}
+          {playbackRate}
+          {isFillScreen}
+          {audioTracks}
+          {selectedAudioTrack}
+          on:playPause={playPause}
+          on:seek={(e) => seek(e.detail)}
+          on:setVolume={(e) => setVolume(e.detail)}
+          on:toggleMute={toggleMute}
+          on:setPlaybackRate={(e) => setPlaybackRate(e.detail)}
+          on:requestFullscreen={toggleFullscreen}
+          on:toggleCinematic={() => { isFillScreen = !isFillScreen; }}
+          on:openEpisodes={() => (showNextEpisodes = true)}
+          on:changeAudioTrack={(e) => changeAudioTrack(e.detail)}
+          on:enterMini={() => enterMiniMode()}
+        />
+      </div>
+
+      <!-- Overlay de Pausa: Mostra informações e próximos episódios quando o vídeo está pausado -->
+      {#if !isPlaying && !showEndOverlay}
+        <div class="absolute inset-0 pointer-events-auto">
+          <PauseOverlay
+            title={currentItem?.nome}
+            synopsis={currentItem?.meta?.descricao}
+            nextEpisodes={proximosDesenhos}
+            currentItemIndex={currentItemIndex}
+            on:continue={playPause}
+            on:next={handlePauseOverlayNext}
+            on:selectEpisode={handlePauseOverlaySelect}
+            on:openEpisodes={handleOpenEpisodesFromOverlay}
+          />
+        </div>
+      {/if}
+
+      <!-- Indicador visual para swipe (não funcional no momento, mas serve como guia) -->
+      <div class="absolute bottom-0 left-1/2 z-10 -translate-x-1/2 pb-2 {showControls ? 'opacity-100' : 'opacity-0'} transition-opacity pointer-events-none" aria-hidden="true">
+        <div class="mx-auto h-1.5 w-16 rounded-full bg-white/70"></div>
+      </div>
+    </div>
+
+    <!-- Painel de Próximos Episódios (mostrado quando o usuário solicita) -->
+    {#if showNextEpisodes}
+      <NextEpisodesPanel
+        episodes={playlist}
+        currentItemIndex={currentItemIndex}
+        on:close={() => (showNextEpisodes = false)}
+        on:select={(e) => {
+          const idx = Number(e.detail);
+          if (!Number.isFinite(idx)) return;
+          currentItemIndex = idx;
+          playCurrentVodItem();
+          showNextEpisodes = false;
+        }}
+      />
+    {/if}
+  {/if}
+
+  <!-- Overlay de Fim de Vídeo: Mostra contagem regressiva para o próximo episódio -->
+  {#if showEndOverlay}
+    <div class="absolute inset-0 z-50 flex items-end justify-center pointer-events-auto">
+      <div class="w-full max-w-3xl mb-12 bg-gradient-to-b from-black/70 to-neutral-900/95 rounded-xl p-4 text-white" on:click|stopPropagation>
+        {#if hasNextEpisode}
+          <div class="flex items-center gap-4">
+            <img src={playlist[currentItemIndex + 1]?.meta?.poster || playlist[currentItemIndex + 1]?.meta?.thumbnail || 'https://placehold.co/320x180/0f1724/ffffff?text=?'} alt="Próximo" class="w-28 h-16 object-cover rounded"/>
+            <div style="flex:1">
+              <div style="font-weight:800">{playlist[currentItemIndex + 1]?.meta?.tituloEpisodio || playlist[currentItemIndex + 1]?.nome}</div>
+              <div style="font-size:13px;opacity:.8">{playlist[currentItemIndex + 1]?.meta?.temporada || ''}</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-weight:700;font-size:22px">{endCountdown}s</div>
+              <button class="mt-2 px-3 py-2 rounded bg-white text-black font-semibold" on:click|stopPropagation={() => performNextEpisode()}>Pular agora</button>
+              <button class="mt-2 ml-2 px-3 py-2 rounded bg-transparent border border-white text-white" on:click|stopPropagation={cancelEndCountdown}>Cancelar</button>
+            </div>
+          </div>
+        {:else}
+          <div class="text-center">
+            <span style="font-weight:800">Fim do conteúdo</span>
+            <div style="margin-top:6px;opacity:.9">Obrigado por assistir</div>
+            <button class="mt-4 px-4 py-2 rounded bg-white text-black font-semibold" on:click|stopPropagation={() => { trySaveProgressNow(); }}>Fechar</button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  <!-- Mini-Player (Fallback para Picture-in-Picture) -->
+  {#if inAppMini}
+    <div
+      class="fixed z-60 rounded overflow-hidden shadow-lg"
+      style="width:220px;height:124px;right:12px;bottom:12px;touch-action:none;cursor:grab;"
+      on:touchstart|preventDefault={(ev)=> miniDragStart(ev)}
+      on:mousedown|preventDefault={(ev)=> miniDragStart(ev)}
+      on:click|stopPropagation={() => { /* keep watching */ }}
+    >
+    </div>
+  {/if}
+
+</div>
+
 <style>
-	video::-webkit-media-controls-fullscreen-button {
-		display: none;
-	}
+  .mini-video {
+    position: fixed !important;
+    width: 220px !important;
+    height: 124px !important;
+    right: 12px !important;
+    bottom: 12px !important;
+    z-index: 9999 !important;
+    border-radius: 10px !important;
+    object-fit: cover !important;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.6) !important;
+    touch-action: none !important;
+  }
+
+  .cinematic-background {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    min-width: 100%;
+    min-height: 100%;
+    width: auto;
+    height: auto;
+    z-index: -1;
+    transform: translate(-50%, -50%) scale(1.2);
+    filter: blur(50px) brightness(0.6);
+    object-fit: cover;
+  }
+
+  :global(html), :global(body) { height: 100%; margin: 0; }
+  :global(body) > :global(#svelte) { height: 100%; }
 </style>
-
-<main class="relative h-full w-full overflow-hidden bg-black">
-	{#if !$userHasInteracted}
-		<div
-			class="absolute inset-0 z-50 flex cursor-pointer flex-col items-center justify-center gap-4 bg-gradient-to-b from-background to-black p-4 text-center"
-			on:click={handleFirstInteraction}
-			on:keydown|once|self={() => {}}
-			role="button"
-			tabindex="0"
-		>
-			<PlayCircle class="h-24 w-24 text-primary drop-shadow-2xl" />
-			<h1 class="font-display text-4xl font-bold text-white drop-shadow-lg">Pronto para assistir?</h1>
-			<p class="max-w-md text-lg text-subtle">
-				{#if isVodMode}
-					Toque para iniciar seu episódio.
-				{:else if !isLoading}
-					Toque para iniciar a transmissão com som.
-				{/if}
-			</p>
-			{#if !isVodMode}
-				<div class="mt-6 flex items-center justify-center gap-2 rounded-full bg-black/30 px-4 py-2 backdrop-blur-md">
-					<span
-						class="h-3 w-3 rounded-full {isLoading
-							? 'animate-pulse bg-yellow-400'
-							: 'bg-green-400'}"
-					></span>
-					<span class="text-sm font-medium text-white">{connectionStatus}</span>
-				</div>
-			{/if}
-		</div>
-	{/if}
-
-	<div
-		class="grid h-full w-full"
-		class:blur-sm={!$userHasInteracted}
-		class:pointer-events-none={!$userHasInteracted}
-		class:md:grid-cols-1={isVodMode}
-		class:md:grid-cols-[1fr_384px]={!isVodMode}
-	>
-		<div bind:this={playerContainer} class="group relative flex items-center justify-center bg-black">
-			<video
-				bind:this={videoPlayer}
-				class="h-full w-full object-contain"
-				autoplay
-				playsinline
-				controls
-				muted={!$userHasInteracted}
-			></video>
-
-			{#if $userHasInteracted}
-				<div
-					class="absolute right-4 top-4 z-20 flex items-center gap-2 rounded-full bg-black/60 p-2 opacity-0 backdrop-blur-xl transition-opacity group-hover:opacity-100"
-				>
-					{#if !isVodMode}
-						<button
-							on:click={() => sendCommand('REGENERATE_TODAY')}
-							aria-label="Recriar Grade"
-							class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
-						>
-							<RefreshCw class="h-5 w-5 text-white" />
-						</button>
-						<button
-							on:click={() => sendCommand('NEXT')}
-							aria-label="Pular Desenho"
-							class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
-						>
-							<SkipForward class="h-5 w-5 text-white" />
-						</button>
-					{/if}
-					<button
-						on:click={toggleFullscreen}
-						aria-label="Tela Cheia"
-						class="flex h-12 w-12 items-center justify-center rounded-full transition-all hover:bg-white/10 active:scale-95"
-					>
-						{#if isFullscreen}
-							<Minimize class="h-5 w-5 text-white" />
-						{:else}
-							<Maximize class="h-5 w-5 text-white" />
-						{/if}
-					</button>
-				</div>
-			{/if}
-
-			{#if !isVodMode && showUpNextPopup && upNextItem}
-				<div
-					transition:scale={{ duration: 400, start: 0.9 }}
-					class="absolute bottom-20 left-4 right-4 z-30 mx-auto max-w-md overflow-hidden rounded-2xl bg-gradient-to-br from-black/90 to-black/70 shadow-2xl backdrop-blur-xl md:left-8 md:right-auto md:bottom-24"
-				>
-					<div class="flex gap-4 p-4">
-						<img
-							src={upNextItem.meta?.poster || 'https://placehold.co/120x180/1a2923/8f9e98?text=?'}
-							alt="Pôster de {upNextItem.nome}"
-							class="h-32 w-20 flex-shrink-0 rounded-lg object-cover shadow-lg"
-						/>
-						<div class="flex flex-col justify-center">
-							<p class="font-display text-xs font-bold uppercase tracking-wider text-primary">
-								A Seguir
-							</p>
-							<h3 class="font-display mt-1 text-xl font-bold leading-tight text-white">
-								{upNextItem.nome}
-							</h3>
-							{#if upNextItem.meta?.tituloEpisodio}
-								<p class="mt-1 text-sm text-white/70">{upNextItem.meta.tituloEpisodio}</p>
-							{/if}
-							<div class="mt-2 flex items-center gap-2 text-xs text-white/60">
-								<span class="rounded bg-white/10 px-2 py-0.5">{upNextItem.tipo?.toUpperCase()}</span>
-								<span>•</span>
-								<span>{formatDuration(upNextItem.duration)}</span>
-							</div>
-						</div>
-					</div>
-				</div>
-			{/if}
-		</div>
-
-		{#if !isVodMode}
-			<aside class="hidden flex-col gap-6 overflow-y-auto bg-surface p-6 md:flex">
-				{#if currentItem}
-					<button
-						on:click={() => (selectedItemForModal = currentItem)}
-						class="block w-full rounded-xl border border-on-subtle/30 bg-gradient-to-br from-background to-surface p-4 text-left shadow-lg transition-all hover:border-primary/50 hover:shadow-xl active:scale-98"
-					>
-						<div class="flex gap-4">
-							<img
-								src={currentItem.meta?.poster ||
-									'https://placehold.co/80x120/1a2923/8f9e98?text=?'}
-								alt="Pôster de {currentItem.nome}"
-								class="h-32 w-20 flex-shrink-0 rounded-lg bg-background object-cover shadow-md"
-							/>
-							<div class="min-w-0">
-								<span class="font-display text-xs font-bold uppercase tracking-wider text-primary">NO AR AGORA</span>
-								<h2 class="font-display mt-1 truncate text-xl font-bold">{currentItem.nome}</h2>
-								<p class="mt-1 truncate text-sm text-subtle">
-									{currentItem.meta?.tituloEpisodio || ' '}
-								</p>
-								<div class="mt-3 flex gap-2 text-xs text-subtle">
-									<span class="rounded-full bg-on-subtle/30 px-2 py-0.5"
-										>{currentItem.tipo?.toUpperCase()}</span
-									>
-									<span class="flex items-center gap-1">
-										<span class="h-1 w-1 rounded-full bg-subtle"></span>
-										{formatDuration(currentItem.duration)}
-									</span>
-								</div>
-							</div>
-						</div>
-					</button>
-				{/if}
-				<div>
-					<h3
-						class="font-display mb-4 border-b border-on-subtle/30 pb-2 text-sm font-bold uppercase tracking-wider text-subtle"
-					>
-						Próximos Episódios
-					</h3>
-					<div class="flex flex-col gap-2">
-						{#each proximosDesenhos as item (item.src)}
-							<button
-								on:click={() => (selectedItemForModal = item)}
-								class="group/card flex items-center gap-4 rounded-xl border border-transparent p-3 text-left transition-all hover:border-primary/30 hover:bg-on-subtle/20 active:scale-98"
-							>
-								<img
-									src={item.meta?.poster || 'https://placehold.co/112x64/1a2923/8f9e98?text=?'}
-									alt="Pôster de {item.nome}"
-									class="h-16 w-28 flex-shrink-0 rounded-lg bg-background object-cover shadow-md"
-								/>
-								<div class="min-w-0 flex-1">
-									<p class="truncate font-semibold">{item.nome}</p>
-									<span class="text-xs text-primary">{formatDuration(item.duration)}</span>
-								</div>
-							</button>
-						{:else}
-							<p class="p-4 text-center text-sm text-subtle">Carregando programação...</p>
-						{/each}
-					</div>
-				</div>
-			</aside>
-		{/if}
-	</div>
-
-	{#if !isVodMode}
-		{#if selectedItemForModal}
-			<div
-				transition:fade={{ duration: 200 }}
-				class="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4 backdrop-blur-md"
-				on:click={() => (selectedItemForModal = null)}
-				on:keydown|self={() => {}}
-				role="dialog"
-				tabindex="-1" role="document"
-			>
-				<div
-					transition:scale={{ duration: 300, start: 0.95 }}
-					class="flex w-full max-w-2xl flex-col gap-4 overflow-hidden rounded-2xl border border-on-subtle/30 bg-gradient-to-br from-surface to-background shadow-2xl md:flex-row"
-					on:click|stopPropagation on:keydown|stopPropagation={() => {}} on:keydown|stopPropagation={() => {}}
-					role="document"
-				>
-					<img
-						src={selectedItemForModal.meta?.poster}
-						alt="Poster"
-						class="h-64 w-full object-cover md:h-auto md:w-56"
-					/>
-					<div class="flex flex-col p-6">
-						<h2 class="font-display text-2xl font-bold">{selectedItemForModal.nome}</h2>
-						{#if selectedItemForModal.meta?.tituloEpisodio}
-							<p class="font-semibold text-primary">{selectedItemForModal.meta.tituloEpisodio}</p>
-						{/if}
-						<p class="mt-4 flex-grow text-subtle">
-							{selectedItemForModal.meta?.descricao || 'Nenhuma descrição disponível.'}
-						</p>
-						<div class="mt-4 text-xs text-subtle">
-							<span>{selectedItemForModal.meta?.ano || '----'}</span>
-							<span class="mx-2">•</span>
-							<span>{selectedItemForModal.meta?.genero || 'Desconhecido'}</span>
-						</div>
-					</div>
-				</div>
-			</div>
-		{/if}
-
-		{#if isChannelSelectorOpen}
-			<div
-				transition:fade={{ duration: 200 }}
-				on:click={() => (isChannelSelectorOpen = false)}
-				on:keydown|self={() => {}}
-				class="fixed inset-0 z-50 flex items-end justify-center bg-black/80 backdrop-blur-md sm:items-center"
-				role="dialog"
-				tabindex="-1" role="document"
-			>
-				<div
-					transition:fly={{ y: 50, duration: 300 }}
-					on:click|stopPropagation on:keydown|stopPropagation={() => {}} on:keydown|stopPropagation={() => {}}
-					class="w-full max-w-md rounded-t-2xl border-t border-on-subtle/30 bg-gradient-to-b from-surface to-background shadow-2xl sm:rounded-2xl sm:border"
-					role="document"
-				>
-					<div class="flex items-center justify-between border-b border-on-subtle/30 p-4">
-						<h2 class="font-display text-lg font-bold">Mudar de Canal</h2>
-						<button
-							on:click={() => (isChannelSelectorOpen = false)}
-							class="rounded-full p-2 text-subtle transition-colors hover:bg-white/10"
-							aria-label="Fechar"
-						>
-							<X />
-						</button>
-					</div>
-					<div class="flex max-h-[60vh] flex-col gap-2 overflow-y-auto p-4">
-						<button
-							on:click={() => switchChannel('main')}
-							class="flex w-full items-center gap-4 rounded-xl border border-transparent p-4 text-left transition-all {currentChannel ===
-							'main'
-								? 'border-primary bg-primary/20 text-primary'
-								: 'hover:border-on-subtle/30 hover:bg-on-subtle/10'}"
-						>
-							<Tv class="h-6 w-6" />
-							<div>
-								<p class="font-bold">Canal Principal</p>
-								<p class="text-sm text-subtle">Programação variada</p>
-							</div>
-						</button>
-						{#each availableChannels as channel (channel.code)}
-							<button
-								on:click={() => switchChannel(channel.code)}
-								class="flex w-full items-center gap-4 rounded-xl border border-transparent p-4 text-left transition-all {currentChannel ===
-								channel.code
-									? 'border-primary bg-primary/20 text-primary'
-									: 'hover:border-on-subtle/30 hover:bg-on-subtle/10'}"
-							>
-								<span class="text-2xl">🎬</span>
-								<div>
-									<p class="font-bold">{channel.nome}</p>
-									<p class="text-sm text-subtle">{channel.totalEpisodios} episódios</p>
-								</div>
-							</button>
-						{/each}
-					</div>
-				</div>
-			</div>
-		{/if}
-	{/if}
-</main>
